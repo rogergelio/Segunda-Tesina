@@ -1,0 +1,57 @@
+# ── Data files ────────────────────────────────────────────────────────────────
+*.csv
+*.parquet
+*.xlsx
+*.xls
+*.json
+
+# ── ML model artifacts ────────────────────────────────────────────────────────
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+catboost_info/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Environments ──────────────────────────────────────────────────────────────
+.env
+.venv/
+venv/
+env/
+*.env.*
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+*.pem
+*.key
+secrets.*
+credentials.*
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+
+# ── Exceptions: keep the xT grid (small reference file used by the app) ───────
+!Models/xT/xt.csv
