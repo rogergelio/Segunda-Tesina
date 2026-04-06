@@ -7,8 +7,8 @@ Strategy:
   3. Compute xT, aggregate per player, and save parquet outputs.
 
 Key design:
-  • Passes  (Pass / OffsidePass, Successful, has end_x/end_y) → added_xt = end_xt - start_xt
-  • Dribbles (TakeOn, Successful) → NO end coordinates in DB → added_xt = start_xt
+  • Passes  (Pass / OffsidePass, Successful, has end_x/end_y) -> added_xt = end_xt - start_xt
+  • Dribbles (TakeOn, Successful) -> NO end coordinates in DB -> added_xt = start_xt
 
 Outputs:
   player_xt_stats.parquet   — one row per player
@@ -50,11 +50,11 @@ from constants import POSITION_MAP, GROUPED_POSITION_MAP
 
 def fix_name(s: str) -> str:
     """
-    Fix double-CP1252 encoded player names (e.g. 'MÃ¼ller' → 'Müller').
+    Fix double-CP1252 encoded player names (e.g. 'MÃ¼ller' -> 'Müller').
 
     Encoding history in the DB:
-      char → UTF-8 bytes → misread as CP1252 chars → stored as UTF-8 (twice).
-    Reverse: encode CP1252 → decode UTF-8, applied up to twice.
+      char -> UTF-8 bytes -> misread as CP1252 chars -> stored as UTF-8 (twice).
+    Reverse: encode CP1252 -> decode UTF-8, applied up to twice.
 
     Names with 'ï¿½' contain U+FFFD (replacement char) — the original byte was
     lost at scrape time.  The SQL query now prefers clean records, so this path
@@ -84,7 +84,7 @@ def get_conn():
 def _read(conn, query: str, label: str) -> pd.DataFrame:
     print(f"[data_prep] Pulling {label} …", flush=True)
     df = pd.read_sql(query, conn)
-    print(f"  → {len(df):,} rows", flush=True)
+    print(f"  -> {len(df):,} rows", flush=True)
     return df
 
 
@@ -110,7 +110,8 @@ def main():
         SELECT player_id, match_id, team_id,
                x, y, end_x, end_y,
                type_display_name, outcome_type_display_name,
-               qualifiers::text AS qualifiers
+               qualifiers::text AS qualifiers,
+               period_display_name, minute, second
         FROM match_events
         """,
         "match_events"
@@ -173,7 +174,7 @@ def main():
                 mapped.append(label)
         return "|".join(mapped)
 
-    # Most-played non-sub position per player → used as the ranking context position
+    # Most-played non-sub position per player -> used as the ranking context position
     primary_pos_df = (
         valid_pos
         .sort_values("games_at_pos", ascending=False)
@@ -181,7 +182,7 @@ def main():
         .rename(columns={"position": "primary_position"})
     )
 
-    # All qualifying positions (pipe-separated, no Sub) → used for filter matching
+    # All qualifying positions (pipe-separated, no Sub) -> used for filter matching
     pos_list_df = (
         valid_pos
         .groupby("player_id")["position"]
@@ -215,11 +216,19 @@ def main():
     print("[data_prep] Coercing numeric columns …", flush=True)
     for col in ["x", "y", "end_x", "end_y"]:
         events[col] = pd.to_numeric(events[col], errors="coerce")
+    _PERIOD_ORDER = {
+        "FirstHalf": 1, "SecondHalf": 2,
+        "ExtraFirstHalf": 3, "ExtraSecondHalf": 4,
+        "PenaltyShootout": 5,
+    }
+    events["_period_num"] = events["period_display_name"].map(_PERIOD_ORDER).fillna(9)
+    for col in ["minute", "second"]:
+        events[col] = pd.to_numeric(events[col], errors="coerce").fillna(0)
     matches["home_id"] = pd.to_numeric(matches["home_id"], errors="coerce")
     matches["away_id"] = pd.to_numeric(matches["away_id"], errors="coerce")
 
     # ── 3. Attach match metadata to every event ────────────────────────────────
-    print("[data_prep] Joining events → matches …", flush=True)
+    print("[data_prep] Joining events -> matches …", flush=True)
     events = events.merge(
         matches[["match_id", "competition", "season", "home_id", "away_id",
                  "home_team", "away_team"]],
@@ -234,6 +243,19 @@ def main():
     )
     events.drop(columns=["home_id", "away_id", "home_team", "away_team"],
                 inplace=True)
+
+    # ── 3b. Sort temporally; compute next-action coordinates ──────────────────
+    # Sorting must happen over the full event sequence (before any filtering)
+    # so that shift(-1) gives the true immediately-following action per match.
+    print("[data_prep] Sorting events by match -> period -> minute -> second …",
+          flush=True)
+    events = events.sort_values(
+        ["match_id", "_period_num", "minute", "second"], na_position="last"
+    ).reset_index(drop=True)
+
+    # x/y of the next action in the same match — used to estimate dribble end
+    events["_next_x"] = events.groupby("match_id")["x"].shift(-1)
+    events["_next_y"] = events.groupby("match_id")["y"].shift(-1)
 
     # ── 4. Match count per (player, competition, season) ──────────────────────
     # A player who transferred mid-season gets one row per league they played in.
@@ -259,12 +281,11 @@ def main():
     print("[data_prep] Excluding set-piece events …", flush=True)
     before = len(events)
     events = events[~events["qualifiers"].apply(_is_setpiece)].copy()
-    print(f"  → Removed {before - len(events):,} set-piece events "
+    print(f"  -> Removed {before - len(events):,} set-piece events "
           f"({len(events):,} remaining)", flush=True)
 
     # ── 5. Filter to relevant event types ─────────────────────────────────────
-    print("[data_prep] Filtering to Pass / OffsidePass / TakeOn …", flush=True)
-    events.to_csv('events_df.csv')
+    print("[data_prep] Filtering to Pass / OffsidePass / TakeOn / GoodSkill …", flush=True)
     is_pass    = (
         events["type_display_name"].isin(["Pass", "OffsidePass"]) &
         (events["outcome_type_display_name"] == "Successful") &
@@ -272,14 +293,14 @@ def main():
         events["end_y"].notna()
     )
     is_dribble = (
-        (events["type_display_name"] == "TakeOn") &
+        events["type_display_name"].isin(["TakeOn", "GoodSkill"]) &
         (events["outcome_type_display_name"] == "Successful")
     )
 
     passes   = events[is_pass].copy()
     dribbles = events[is_dribble].copy()
-    print(f"  → {len(passes):,} valid pass events", flush=True)
-    print(f"  → {len(dribbles):,} valid dribble events", flush=True)
+    print(f"  -> {len(passes):,} valid pass events", flush=True)
+    print(f"  -> {len(dribbles):,} valid dribble events", flush=True)
 
     # ── 6. Compute xT ─────────────────────────────────────────────────────────
     print("[data_prep] Computing xT — passes …", flush=True)
@@ -290,11 +311,26 @@ def main():
     passes["is_dribble"] = False
 
     print("[data_prep] Computing xT — dribbles …", flush=True)
+    # end_x/end_y estimated from the next action in the same match (pre-computed above).
+    # The dribbles index aligns with events (both share the same reset 0…n index
+    # minus set-piece rows that were dropped without a re-index).
+    dribbles["end_x"] = events.loc[dribbles.index, "_next_x"].values
+    dribbles["end_y"] = events.loc[dribbles.index, "_next_y"].values
+
     dribbles["start_xt"] = _lookup_xt(dribbles["x"].values, dribbles["y"].values)
-    dribbles["end_xt"]   = np.nan
-    dribbles["end_x"]    = np.nan
-    dribbles["end_y"]    = np.nan
-    dribbles["added_xt"] = dribbles["start_xt"]   # zone-threat proxy
+
+    has_end = dribbles["end_x"].notna() & dribbles["end_y"].notna()
+    dribbles["end_xt"] = np.nan
+    dribbles.loc[has_end, "end_xt"] = _lookup_xt(
+        dribbles.loc[has_end, "end_x"].values,
+        dribbles.loc[has_end, "end_y"].values,
+    )
+    # added_xt = end_xt − start_xt where we have an end position;
+    # fall back to start_xt (zone-threat proxy) for the last action in a match.
+    dribbles["added_xt"] = dribbles["start_xt"].copy()
+    dribbles.loc[has_end, "added_xt"] = (
+        dribbles.loc[has_end, "end_xt"] - dribbles.loc[has_end, "start_xt"]
+    )
     dribbles["is_pass"]    = False
     dribbles["is_dribble"] = True
 
@@ -313,7 +349,7 @@ def main():
     )
     print(f"[data_prep] Total events: {len(all_events):,}", flush=True)
     all_events.to_parquet(EVENTS_OUT, index=False)
-    print(f"  → Saved: {EVENTS_OUT}", flush=True)
+    print(f"  -> Saved: {EVENTS_OUT}", flush=True)
     all_events.to_csv("all_events.csv")
 
     # ── 8. Aggregate pass xT per (player, competition, season) ────────────────
@@ -378,8 +414,8 @@ def main():
     print(f"[data_prep] {len(stats):,} players in final stats table.", flush=True)
     stats.to_parquet(STATS_OUT, index=False)
     stats.to_csv(STATS_CSV, index=False)
-    print(f"  → Saved: {STATS_OUT}", flush=True)
-    print(f"  → Saved: {STATS_CSV}", flush=True)
+    print(f"  -> Saved: {STATS_OUT}", flush=True)
+    print(f"  -> Saved: {STATS_CSV}", flush=True)
 
     # ── 11. League × season coverage table ────────────────────────────────────
     print("[data_prep] Building league/season coverage table …", flush=True)
@@ -405,7 +441,7 @@ def main():
     )
 
     coverage.to_csv(COVERAGE_CSV, index=False)
-    print(f"  → Saved: {COVERAGE_CSV}", flush=True)
+    print(f"  -> Saved: {COVERAGE_CSV}", flush=True)
     print(coverage.to_string(index=False), flush=True)
     print("[data_prep] Done.", flush=True)
 

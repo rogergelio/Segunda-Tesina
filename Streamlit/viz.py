@@ -17,6 +17,7 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+from matplotlib.colors import TwoSlopeNorm
 from mplsoccer import Pitch
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ CMAP_MINT = matplotlib.colors.LinearSegmentedColormap.from_list(
     "mint", [BG_DARK, "#004d3d", MINT])
 CMAP_AQUA = matplotlib.colors.LinearSegmentedColormap.from_list(
     "aqua", [BG_DARK, "#003340", AQUA])
+CMAP_DIFF = matplotlib.colors.LinearSegmentedColormap.from_list(
+    "diff", [RED, BG_DARK, GREEN])
 
 FIG_W, FIG_H = 10, 6.5
 STROKE = [pe.Stroke(linewidth=2.5, foreground="black"), pe.Normal()]
@@ -63,7 +66,7 @@ def _base_fig(nrows=1, ncols=1, **kwargs):
 
 
 def _subtitle(ax, text):
-    ax.set_title(text, color=DIM, fontsize=9, pad=4)
+    ax.set_title(text, color=WHITE, fontsize=12, fontweight="bold", pad=6)
 
 
 def _lookup_xt(x_arr, y_arr, xt_grid):
@@ -122,6 +125,11 @@ def plot_xt_heatmap(
     flag = "is_pass" if event_type == "pass" else "is_dribble"
     df = events_df[events_df[flag]].copy()
 
+    # Per-90 denominator: number of unique matches the player appeared in
+    n90 = max(
+        events_df["match_id"].nunique() if "match_id" in events_df.columns else 1, 1
+    )
+
     fig, ax = _base_fig()
     if df.empty:
         ax.text(50, 50, "No data", color=WHITE, ha="center", va="center", fontsize=12)
@@ -129,7 +137,7 @@ def plot_xt_heatmap(
             _subtitle(ax, title)
         return fig
 
-    if use_end and event_type == "pass":
+    if use_end:
         mask = df["end_x"].notna() & df["end_y"].notna()
         df   = df[mask]
         x, y = df["end_x"].values, df["end_y"].values
@@ -140,10 +148,11 @@ def plot_xt_heatmap(
         vals = df["start_xt"].values
         cmap = CMAP_MINT
 
-    stat = pitch.bin_statistic(x, y, statistic="sum", values=vals, bins=BINS)
-    hm   = pitch.heatmap(stat, ax=ax, cmap=cmap,
-                         vmin=0, vmax=vmax if vmax else stat["statistic"].max() or 1,
-                         edgecolors="none")
+    stat = dict(pitch.bin_statistic(x, y, statistic="sum", values=vals, bins=BINS))
+    stat["statistic"] = stat["statistic"] / n90
+    effective_vmax = vmax if vmax else stat["statistic"].max() or 1
+    hm = pitch.heatmap(stat, ax=ax, cmap=cmap,
+                       vmin=0, vmax=effective_vmax, edgecolors="none")
     _colorbar(hm, ax)
     if title:
         _subtitle(ax, title)
@@ -157,6 +166,7 @@ def plot_vs_average_pair(
     event_type: str = "pass",
     use_end: bool = False,
     row_title: str = "",
+    player_name: str = "Player",
 ):
     """
     Side-by-side: [Player | Position Average] for one heatmap type.
@@ -169,41 +179,54 @@ def plot_vs_average_pair(
         sub = df[df[flag]].copy()
         if sub.empty:
             return None, None, None
-        if use_end and event_type == "pass":
+        if use_end:
             sub = sub[sub["end_x"].notna() & sub["end_y"].notna()]
+            if sub.empty:
+                return None, None, None
             return sub["end_x"].values, sub["end_y"].values, sub["end_xt"].values
         return sub["x"].values, sub["y"].values, sub["start_xt"].values
 
     px, py, pv = _coords_vals(player_df)
     ax_, ay, av = _coords_vals(avg_df)
 
-    # Normalise peer group by number of unique players so both sides show
-    # "total xT accumulated in each zone" on a per-player basis.
-    n_avg_players = (
-        avg_df["player_id"].nunique()
-        if avg_df is not None and "player_id" in avg_df.columns
-        else 1
-    ) or 1
+    # Per-90 denominators:
+    #   player  → unique matches for that player
+    #   peers   → sum of unique matches per peer player (total peer-90s)
+    player_n90 = max(
+        player_df["match_id"].nunique() if "match_id" in player_df.columns else 1, 1
+    )
+    if "player_id" in avg_df.columns and "match_id" in avg_df.columns:
+        peer_n90 = max(
+            avg_df.groupby("player_id")["match_id"].nunique().sum(), 1
+        )
+    else:
+        peer_n90 = max(avg_df["match_id"].nunique() if "match_id" in avg_df.columns else 1, 1)
 
     def _stat_sum(x, y, v, divisor=1):
         if x is None or len(x) == 0:
             return None
         st = pitch.bin_statistic(x, y, statistic="sum", values=v, bins=BINS)
-        st = dict(st)                          # shallow copy so we can mutate
+        st = dict(st)
         st["statistic"] = st["statistic"] / divisor
         return st
 
-    s_p = _stat_sum(px, py, pv, divisor=1)
-    s_a = _stat_sum(ax_, ay, av, divisor=n_avg_players)
+    s_p = _stat_sum(px, py, pv, divisor=player_n90)
+    s_a = _stat_sum(ax_, ay, av, divisor=peer_n90)
     vals_p = s_p["statistic"] if s_p is not None else np.array([0])
     vals_a = s_a["statistic"] if s_a is not None else np.array([0])
     vmax = max(np.nanmax(np.nan_to_num(vals_p)), np.nanmax(np.nan_to_num(vals_a))) or 1.0
 
-    cmap = CMAP_AQUA if use_end else CMAP_MINT
-    fig, axes = _base_fig(nrows=1, ncols=2)
-    ax_p, ax_a = axes[0], axes[1]
+    # Difference grid (player − normalised avg per zone)
+    zero_grid = np.zeros((BINS[1], BINS[0]))
+    diff = (s_p["statistic"] if s_p is not None else zero_grid) \
+         - (s_a["statistic"] if s_a is not None else zero_grid)
+    abs_max = np.nanmax(np.abs(diff)) or 1.0
 
-    for stat, ax, lbl in [(s_p, ax_p, "Selected Player"), (s_a, ax_a, "Position Avg (per player)")]:
+    cmap = CMAP_AQUA if use_end else CMAP_MINT
+    fig, axes = _base_fig(nrows=1, ncols=3)
+    ax_p, ax_a, ax_d = axes[0], axes[1], axes[2]
+
+    for stat, ax, lbl in [(s_p, ax_p, f"{player_name} xT/90"), (s_a, ax_a, "Position Avg xT/90")]:
         if stat is None:
             ax.text(50, 50, "No data", color=WHITE, ha="center", va="center")
         else:
@@ -212,8 +235,17 @@ def plot_vs_average_pair(
             _colorbar(hm, ax)
         _subtitle(ax, lbl)
 
+    # Difference panel — green = above avg, red = below avg, BG_DARK ≈ zero
+    diff_stat = dict(s_p if s_p is not None else s_a)
+    diff_stat["statistic"] = diff
+    norm = TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+    hm_d = pitch.heatmap(diff_stat, ax=ax_d, cmap=CMAP_DIFF,
+                         norm=norm, edgecolors="none")
+    _colorbar(hm_d, ax_d)
+    _subtitle(ax_d, "Difference (Player − Avg)")
+
     if row_title:
-        fig.suptitle(row_title, color=MINT, fontsize=12, fontweight="bold", y=1.02)
+        fig.suptitle(row_title, color=MINT, fontsize=13, fontweight="bold", y=0.98)
     return fig
 
 
@@ -338,42 +370,55 @@ def plot_top_plays(
 
 # ─── Tab 3: Player Comparison ─────────────────────────────────────────────────
 
-def plot_comparison(
+def plot_comparison_trio(
     p1_events: pd.DataFrame,
     p2_events: pd.DataFrame,
     p1_name: str,
     p2_name: str,
-    event_flag: str = "is_pass",
-    weight_by: str = "added_xt",
-    xt_grid: np.ndarray = None,
+    event_type: str = "pass",
+    use_end: bool = False,
+    title: str = "",
 ):
-    """Side-by-side heatmaps for two players."""
-    label = "Passing" if event_flag == "is_pass" else "Dribbling"
-    use_end = (event_flag == "is_pass")
+    """
+    Three-panel comparison: [Player 1 xT/90 | Player 2 xT/90 | Difference (P1 − P2)].
+    Each player normalised by their own match count for a fair per-90 comparison.
+    Difference panel: green = P1 above P2, red = P1 below P2.
+    """
+    flag = "is_pass" if event_type == "pass" else "is_dribble"
     cmap = CMAP_AQUA if use_end else CMAP_MINT
 
     def _prep(ev):
-        sub = ev[ev[event_flag]].copy()
+        sub = ev[ev[flag]].copy()
         if use_end:
             sub = sub[sub["end_x"].notna() & sub["end_y"].notna()]
             return sub["end_x"].values, sub["end_y"].values, sub["end_xt"].values
         return sub["x"].values, sub["y"].values, sub["start_xt"].values
 
-    x1, y1, v1 = _prep(p1_events)
-    x2, y2, v2 = _prep(p2_events)
-
-    def _stat(x, y, v):
+    def _stat(x, y, v, n90):
         if len(x) == 0:
             return None
-        return pitch.bin_statistic(x, y, statistic="sum", values=v, bins=BINS)
+        s = dict(pitch.bin_statistic(x, y, statistic="sum", values=v, bins=BINS))
+        s["statistic"] = s["statistic"] / max(n90, 1)
+        return s
 
-    s1, s2 = _stat(x1, y1, v1), _stat(x2, y2, v2)
-    vmax = max(
-        np.nanmax(s1["statistic"]) if s1 else 0,
-        np.nanmax(s2["statistic"]) if s2 else 0,
-    ) or 1.0
+    n90_1 = max(p1_events["match_id"].nunique() if "match_id" in p1_events.columns else 1, 1)
+    n90_2 = max(p2_events["match_id"].nunique() if "match_id" in p2_events.columns else 1, 1)
 
-    fig, axes = _base_fig(nrows=1, ncols=2)
+    x1, y1, v1 = _prep(p1_events)
+    x2, y2, v2 = _prep(p2_events)
+    s1 = _stat(x1, y1, v1, n90_1)
+    s2 = _stat(x2, y2, v2, n90_2)
+
+    zero = np.zeros((BINS[1], BINS[0]))
+    g1   = s1["statistic"] if s1 is not None else zero
+    g2   = s2["statistic"] if s2 is not None else zero
+
+    vmax    = max(np.nanmax(g1), np.nanmax(g2)) or 1.0
+    diff    = g1 - g2
+    abs_max = np.nanmax(np.abs(diff)) or 1.0
+
+    fig, axes = _base_fig(nrows=1, ncols=3)
+
     for stat, ax, name in [(s1, axes[0], p1_name), (s2, axes[1], p2_name)]:
         if stat is None:
             ax.text(50, 50, "No data", color=WHITE, ha="center", va="center")
@@ -383,8 +428,17 @@ def plot_comparison(
             _colorbar(hm, ax)
         _subtitle(ax, name)
 
-    fig.suptitle(f"{label} xT Comparison", color=MINT,
-                 fontsize=13, fontweight="bold", y=1.01)
+    diff_stat = dict(s1 if s1 is not None else s2 if s2 is not None
+                     else {"statistic": zero, "binnumber": None, "inside": None})
+    diff_stat["statistic"] = diff
+    norm  = TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+    hm_d  = pitch.heatmap(diff_stat, ax=axes[2], cmap=CMAP_DIFF,
+                          norm=norm, edgecolors="none")
+    _colorbar(hm_d, axes[2])
+    _subtitle(axes[2], f"Difference  ({p1_name} − {p2_name})")
+
+    if title:
+        fig.suptitle(title, color=MINT, fontsize=13, fontweight="bold", y=0.98)
     return fig
 
 
@@ -441,6 +495,52 @@ def plot_rank_bar(
         ax.text(bar.get_width() + max_val * 0.01,
                 bar.get_y() + bar.get_height() / 2,
                 f"{val:.2f}", va="center", color=WHITE, fontsize=8)
+
+    fig.tight_layout()
+    return fig
+
+
+# ─── Tab 4: Team Analysis ─────────────────────────────────────────────────────
+
+def plot_team_rank_bar(
+    team_agg: pd.DataFrame,
+    sel_team: str,
+    metric: str,
+    label: str,
+    global_pct: float = None,
+):
+    """
+    Horizontal bar chart of teams sorted by `metric`.
+    `team_agg` must have columns: 'team_name' and `metric`.
+    Selected team highlighted in mint; all others in navy.
+    `global_pct` (0–100), when provided, is annotated as a subtitle.
+    """
+    df = team_agg.sort_values(metric).reset_index(drop=True)
+    colors = [MINT if t == sel_team else "#2a4060" for t in df["team_name"]]
+
+    fig, ax = plt.subplots(figsize=(7, max(4, len(df) * 0.48)))
+    fig.patch.set_facecolor(BG_CARD)
+    ax.set_facecolor(BG_CARD)
+
+    bars = ax.barh(df["team_name"], df[metric], color=colors, height=0.65)
+
+    ax.set_xlabel(label, color=WHITE, fontsize=10)
+    ax.xaxis.label.set_color(WHITE)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(axis="x", colors=DIM)
+    ax.tick_params(axis="y", colors=WHITE, labelsize=9)
+
+    max_val = df[metric].max() or 1
+    for bar, val in zip(bars, df[metric]):
+        ax.text(bar.get_width() + max_val * 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f"{val:.2f}", va="center", color=WHITE, fontsize=8)
+
+    if global_pct is not None:
+        top_global = 100 - global_pct
+        ax.set_title(f"Global ranking: Top {top_global:.0f}%",
+                     color=DIM, fontsize=9, pad=4)
 
     fig.tight_layout()
     return fig

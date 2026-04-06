@@ -14,15 +14,15 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from constants import GROUP_TO_FULL_POSITIONS
+from constants import GROUP_TO_FULL_POSITIONS, GROUPED_POSITION_MAP
 from viz import (
     BG_CARD, MINT, GREEN, AMBER, RED, DIM, WHITE,
-    BINS, pitch,
     plot_xt_heatmap,
     plot_vs_average_pair,
     plot_top_plays,
-    plot_comparison,
+    plot_comparison_trio,
     plot_rank_bar,
+    plot_team_rank_bar,
     _lookup_xt,
 )
 
@@ -302,19 +302,41 @@ if sel_teams:
 # ── Position-level peers (season-scoped) ──────────────────────────────────────
 # Use the most-played non-sub position as the ranking anchor.
 _primary_pos = (player_row.get("primary_position") or player_row["position"])
+_primary_group = (player_row.get("primary_grouped_position")
+                  or GROUPED_POSITION_MAP.get(_primary_pos, _primary_pos))
+
 _pos_list_col = ("position_list"
                  if "position_list" in stats_season.columns
                  else "position")
+_grp_list_col2 = ("grouped_position_list"
+                  if "grouped_position_list" in stats_season.columns
+                  else "grouped_position")
 
 def _pos_peers(base: pd.DataFrame, competition: str = None, min_ev: int = min_events):
-    mask = _any_in(base[_pos_list_col], [_primary_pos])
-    df = base[mask]
+    """Peers whose MAIN position matches the selected player's primary position."""
+    pri_col = ("primary_position"
+               if "primary_position" in base.columns
+               else _pos_list_col)
+    df = base[base[pri_col] == _primary_pos]
     if competition is not None:
         df = df[df["competition"] == competition]
     return df[(df["pass_xt_count"] + df["dribble_xt_count"]) >= min_ev]
 
-pos_league_peers = _pos_peers(stats_season, competition=player_row["competition"])
-pos_global_peers = _pos_peers(stats_season)
+def _grp_peers(base: pd.DataFrame, competition: str = None, min_ev: int = min_events):
+    """Peers whose MAIN position group matches the selected player's main group.
+    Uses primary_grouped_position (single value = group with most games played),
+    so a player who mostly plays Right Defender is never mixed into Left Defender peers."""
+    grp_col = ("primary_grouped_position"
+               if "primary_grouped_position" in base.columns
+               else _grp_list_col2)
+    df = base[base[grp_col] == _primary_group]
+    if competition is not None:
+        df = df[df["competition"] == competition]
+    return df[(df["pass_xt_count"] + df["dribble_xt_count"]) >= min_ev]
+
+pos_league_peers  = _pos_peers(stats_season, competition=player_row["competition"])
+pos_global_peers  = _pos_peers(stats_season)
+viz_league_peers  = _grp_peers(stats_season, competition=player_row["competition"])
 age = player_row.get("age")
 age_peers = (
     stats_season[
@@ -344,7 +366,7 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════════════════════════
 #  TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs(["📊 xT Rankings", "🗺️ xT Visualizer", "⚖️ Player Comparison"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 xT Rankings", "🗺️ xT Visualizer", "⚖️ Player Comparison", "🏟️ Team Analysis"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,63 +504,85 @@ with tab2:
             show_vs_avg = st.toggle("Compare vs Position Average", value=False)
             st.markdown("---")
 
-            # Peer events for vs-avg comparison and arrow benchmark
-            peer_ids = pos_league_peers["player_id"].tolist()
-            avg_ev   = None
-            if show_vs_avg and peer_ids:
+            # Peer events — use position-GROUP peers (same league) for the visualizer
+            viz_peer_ids = viz_league_peers["player_id"].tolist()
+            avg_ev = None
+            if show_vs_avg and viz_peer_ids:
                 avg_ev = enrich_events(
-                    all_events[all_events["player_id"].isin(peer_ids)], xt_grid
+                    all_events[all_events["player_id"].isin(viz_peer_ids)], xt_grid
                 )
 
             position_avg_xt = None
-            if peer_ids:
-                peer_ev = all_events[all_events["player_id"].isin(peer_ids)]
+            if viz_peer_ids:
+                peer_ev = all_events[all_events["player_id"].isin(viz_peer_ids)]
                 if len(peer_ev):
                     position_avg_xt = float(peer_ev["added_xt"].clip(lower=0).mean())
 
             # ── Passes row ────────────────────────────────────────────────────
-            st.markdown("#### Passes")
             pc1, pc2 = st.columns(2)
             with pc1:
-                st.markdown("**Start xT** — where passes originate")
+                st.markdown(f"**{pname_vis} — Pass Start xT / 90**")
                 if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(player_events, avg_ev, xt_grid,
-                                               event_type="pass", use_end=False,
-                                               row_title="Pass Start xT")
+                    fig = plot_vs_average_pair(
+                        player_events, avg_ev, xt_grid,
+                        event_type="pass", use_end=False,
+                        row_title=f"{pname_vis} · Pass xT/90 — Start Position",
+                        player_name=pname_vis)
                 else:
-                    fig = plot_xt_heatmap(player_events, xt_grid,
-                                          event_type="pass", use_end=False,
-                                          title="Pass Start xT")
+                    fig = plot_xt_heatmap(
+                        player_events, xt_grid,
+                        event_type="pass", use_end=False,
+                        title=f"{pname_vis} · Pass xT/90 — Start Position")
                 st.pyplot(fig); plt.close("all")
 
             with pc2:
-                st.markdown("**End xT** — where passes land")
+                st.markdown(f"**{pname_vis} — Pass End xT / 90**")
                 if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(player_events, avg_ev, xt_grid,
-                                               event_type="pass", use_end=True,
-                                               row_title="Pass End xT")
+                    fig = plot_vs_average_pair(
+                        player_events, avg_ev, xt_grid,
+                        event_type="pass", use_end=True,
+                        row_title=f"{pname_vis} · Pass xT/90 — End Position",
+                        player_name=pname_vis)
                 else:
-                    fig = plot_xt_heatmap(player_events, xt_grid,
-                                          event_type="pass", use_end=True,
-                                          title="Pass End xT")
+                    fig = plot_xt_heatmap(
+                        player_events, xt_grid,
+                        event_type="pass", use_end=True,
+                        title=f"{pname_vis} · Pass xT/90 — End Position")
                 st.pyplot(fig); plt.close("all")
 
             st.markdown("---")
 
             # ── Dribbles row ──────────────────────────────────────────────────
-            st.markdown("#### Dribbles")
-            st.caption("No end coordinates available for dribbles — start position only.")
-            dc1, _ = st.columns(2)
+            st.caption("End position estimated from next action in the same match.")
+            dc1, dc2 = st.columns(2)
             with dc1:
-                st.markdown("**Start xT** — zones where the player dribbles")
+                st.markdown(f"**{pname_vis} — Dribble Start xT / 90**")
                 if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(player_events, avg_ev, xt_grid,
-                                               event_type="dribble", use_end=False,
-                                               row_title="Dribble Start xT")
+                    fig = plot_vs_average_pair(
+                        player_events, avg_ev, xt_grid,
+                        event_type="dribble", use_end=False,
+                        row_title=f"{pname_vis} · Dribble xT/90 — Start Position",
+                        player_name=pname_vis)
                 else:
-                    fig = plot_xt_heatmap(player_events, xt_grid,
-                                          event_type="dribble", use_end=False,
-                                          title="Dribble Start xT")
+                    fig = plot_xt_heatmap(
+                        player_events, xt_grid,
+                        event_type="dribble", use_end=False,
+                        title=f"{pname_vis} · Dribble xT/90 — Start Position")
+                st.pyplot(fig); plt.close("all")
+
+            with dc2:
+                st.markdown(f"**{pname_vis} — Dribble End xT / 90**")
+                if show_vs_avg and avg_ev is not None:
+                    fig = plot_vs_average_pair(
+                        player_events, avg_ev, xt_grid,
+                        event_type="dribble", use_end=True,
+                        row_title=f"{pname_vis} · Dribble xT/90 — End Position",
+                        player_name=pname_vis)
+                else:
+                    fig = plot_xt_heatmap(
+                        player_events, xt_grid,
+                        event_type="dribble", use_end=True,
+                        title=f"{pname_vis} · Dribble xT/90 — End Position")
                 st.pyplot(fig); plt.close("all")
 
             st.markdown("---")
@@ -559,103 +603,264 @@ with tab2:
 with tab3:
     st.subheader("Player Comparison")
 
-    # Use the same display labels as the sidebar (includes league suffix for multi-league players)
-    cmp_name_col = "name_clean" if "name_clean" in stats_season.columns else "name"
-    # Build display labels for the full season pool
-    _cmp_counts = stats_season.groupby(cmp_name_col)["competition"].nunique()
-    stats_season = stats_season.copy()
-    stats_season["_cmp_label"] = stats_season.apply(
-        lambda r: (f"{r[cmp_name_col]} ({r['competition']})"
-                   if _cmp_counts.get(r[cmp_name_col], 1) > 1
-                   else r[cmp_name_col]),
-        axis=1,
-    )
-    all_names = sorted(stats_season["_cmp_label"].dropna().unique().tolist())
+    cmp_name_col  = "name_clean" if "name_clean" in stats_season.columns else "name"
+    grp_col_name  = ("primary_grouped_position"
+                     if "primary_grouped_position" in stats_season.columns
+                     else _grp_list_col2)
 
-    # Default to the player already selected in the sidebar
-    _default_label = player_row.get("_display_label", sel_player_name)
-    _default_idx   = all_names.index(_default_label) if _default_label in all_names else 0
+    p1_row  = player_row
+    p1_name = sel_player_name
+    p1_grp  = _primary_group
+    p1_lgue = str(player_row.get("competition", ""))
 
-    c1, c2 = st.columns(2)
-    with c1:
-        p1_label = st.selectbox("Player 1", all_names, index=_default_idx, key="cmp_p1")
-    with c2:
-        p2_label = st.selectbox("Player 2", all_names,
-                                index=min(1, len(all_names) - 1), key="cmp_p2")
+    # ── Selectors ──────────────────────────────────────────────────────────────
+    sel_col, cmp_col = st.columns(2)
 
-    p1_row = stats_season[stats_season["_cmp_label"] == p1_label].iloc[0]
-    p2_row = stats_season[stats_season["_cmp_label"] == p2_label].iloc[0]
-    # Short display names for chart titles (without league suffix)
-    p1_name = p1_row.get(cmp_name_col) or p1_label
-    p2_name = p2_row.get(cmp_name_col) or p2_label
+    with sel_col:
+        st.markdown("#### Selected Player")
+        st.selectbox("Position Group", [p1_grp],  disabled=True, key="p1_grp_lock")
+        st.selectbox("League",         [p1_lgue], disabled=True, key="p1_lgue_lock")
+        st.markdown(f"**{p1_name}**")
 
-    # ── Weighting selector ─────────────────────────────────────────────────────
-    cmp_weight = st.radio(
-        "Weight heatmaps by",
-        options=["added_xt", "start_xt", "end_xt", "count"],
-        format_func=lambda x: {
-            "added_xt": "Net xT added",
-            "start_xt": "Start position xT",
-            "end_xt":   "End position xT",
-            "count":    "Count (frequency)",
-        }[x],
-        horizontal=True,
-        key="cmp_weight",
-    )
+    with cmp_col:
+        st.markdown("#### Comparison Player")
 
-    st.markdown("---")
+        # Position group — default to selected player's group
+        all_cmp_grps = sorted(
+            g for g in stats_season[grp_col_name].dropna().unique()
+            if g != "Substitute"
+        )
+        default_grp_idx = all_cmp_grps.index(p1_grp) if p1_grp in all_cmp_grps else 0
+        cmp_grp = st.selectbox("Position Group", all_cmp_grps,
+                               index=default_grp_idx, key="p2_grp")
 
-    # ── Stats + percentile table ───────────────────────────────────────────────
-    metrics = [
-        ("Pass xT/90",    "pass_xt_per90",    pos_global_peers),
-        ("Dribble xT/90", "dribble_xt_per90", pos_global_peers),
-        ("Total xT/90",   "total_xt_per90",   pos_global_peers),
-    ]
+        # League — default to selected player's league
+        all_cmp_lgues   = sorted(stats_season["competition"].dropna().unique())
+        default_lgue_idx = (all_cmp_lgues.index(p1_lgue)
+                            if p1_lgue in all_cmp_lgues else 0)
+        cmp_lgue = st.selectbox("League", all_cmp_lgues,
+                                index=default_lgue_idx, key="p2_lgue")
 
-    cmp_rows = []
-    for metric_label, col, peers in metrics:
-        p1_val  = p1_row[col]
-        p2_val  = p2_row[col]
-        p1_pct  = pct_rank(p1_val, peers[col]) if not peers.empty else None
-        p2_pct  = pct_rank(p2_val, peers[col]) if not peers.empty else None
+        # Player pool filtered by group + league (using main position group)
+        cmp_pool = stats_season[
+            (stats_season[grp_col_name] == cmp_grp) &
+            (stats_season["competition"] == cmp_lgue) &
+            ((stats_season["pass_xt_count"] + stats_season["dribble_xt_count"]) >= min_events)
+        ].copy()
 
-        cmp_rows.append({
-            "Metric":         metric_label,
-            p1_name:          f"{p1_val:.2f}",
-            f"{p1_name} Pct": f"Top {100 - p1_pct:.0f}%" if p1_pct is not None else "–",
-            p2_name:          f"{p2_val:.2f}",
-            f"{p2_name} Pct": f"Top {100 - p2_pct:.0f}%" if p2_pct is not None else "–",
-        })
+        if cmp_pool.empty:
+            st.warning("No players found for these filters.")
+            p2_row, p2_name = None, None
+        else:
+            cmp_player_names = sorted(cmp_pool[cmp_name_col].dropna().tolist())
+            p2_name = st.selectbox("Player", cmp_player_names, key="cmp_p2_name")
+            p2_row  = cmp_pool[cmp_pool[cmp_name_col] == p2_name].iloc[0]
 
-    # Matches row (no percentile)
-    cmp_rows.append({
-        "Metric":         "Matches (est.)",
-        p1_name:          str(int(p1_row["matches_played"])),
-        f"{p1_name} Pct": "–",
-        p2_name:          str(int(p2_row["matches_played"])),
-        f"{p2_name} Pct": "–",
-    })
-
-    st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), use_container_width=True)
-    st.markdown("---")
-
-    # ── Heatmaps ───────────────────────────────────────────────────────────────
-    if all_events.empty:
-        st.warning("Event data missing. Run data_prep.py.")
-    else:
-        p1_events = enrich_events(get_player_events(all_events, int(p1_row["player_id"])), xt_grid)
-        p2_events = enrich_events(get_player_events(all_events, int(p2_row["player_id"])), xt_grid)
-
-        st.markdown("#### Passing xT — End Locations")
-        fig = plot_comparison(p1_events, p2_events, p1_name, p2_name,
-                              event_flag="is_pass", weight_by=cmp_weight, xt_grid=xt_grid)
-        st.pyplot(fig)
-        plt.close("all")
-
+    if p2_row is not None:
         st.markdown("---")
-        st.markdown("#### Dribbling xT — Start Locations")
-        st.caption("Start locations used for dribbles (no end coordinates in source data).")
-        fig = plot_comparison(p1_events, p2_events, p1_name, p2_name,
-                              event_flag="is_dribble", weight_by=cmp_weight, xt_grid=xt_grid)
-        st.pyplot(fig)
-        plt.close("all")
+
+        # ── Stats + percentile table ───────────────────────────────────────────
+        # Percentiles relative to selected player's global peers (same primary position)
+        stat_metrics = [
+            ("Pass xT/90",    "pass_xt_per90"),
+            ("Dribble xT/90", "dribble_xt_per90"),
+            ("Total xT/90",   "total_xt_per90"),
+        ]
+        cmp_rows = []
+        for metric_label, col in stat_metrics:
+            p1_val = p1_row[col]
+            p2_val = p2_row[col]
+            p1_pct = pct_rank(p1_val, pos_global_peers[col]) if not pos_global_peers.empty else None
+            p2_pct = pct_rank(p2_val, pos_global_peers[col]) if not pos_global_peers.empty else None
+            cmp_rows.append({
+                "Metric":         metric_label,
+                p1_name:          f"{p1_val:.2f}",
+                f"{p1_name} %ile": f"Top {100 - p1_pct:.0f}%" if p1_pct is not None else "–",
+                p2_name:          f"{p2_val:.2f}",
+                f"{p2_name} %ile": f"Top {100 - p2_pct:.0f}%" if p2_pct is not None else "–",
+            })
+        cmp_rows.append({
+            "Metric":          "Matches",
+            p1_name:           str(int(p1_row["matches_played"])),
+            f"{p1_name} %ile": "–",
+            p2_name:           str(int(p2_row["matches_played"])),
+            f"{p2_name} %ile": "–",
+        })
+        st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), use_container_width=True)
+        st.markdown("---")
+
+        # ── Heatmap sections ───────────────────────────────────────────────────
+        if all_events.empty:
+            st.warning("Event data missing. Run data_prep.py.")
+        else:
+            p1_ev = enrich_events(
+                get_player_events(all_events, int(p1_row["player_id"])), xt_grid)
+            p2_ev = enrich_events(
+                get_player_events(all_events, int(p2_row["player_id"])), xt_grid)
+
+            for section_title, event_type, use_end in [
+                ("Pass Start xT / 90",    "pass",    False),
+                ("Pass End xT / 90",      "pass",    True),
+                ("Dribble Start xT / 90", "dribble", False),
+                ("Dribble End xT / 90",   "dribble", True),
+            ]:
+                st.markdown(f"#### {section_title}")
+                fig = plot_comparison_trio(
+                    p1_ev, p2_ev, p1_name, p2_name,
+                    event_type=event_type, use_end=use_end,
+                    title=f"{section_title}  ·  {p1_name} vs {p2_name}",
+                )
+                st.pyplot(fig)
+                plt.close("all")
+                st.markdown("---")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 4 — Team Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+with tab4:
+    st.subheader("Team Analysis")
+
+    # ── Selectors ──────────────────────────────────────────────────────────────
+    tl_col, tt_col = st.columns(2)
+    with tl_col:
+        team_leagues    = sorted(stats_season["competition"].dropna().unique())
+        sel_team_league = st.selectbox("League", team_leagues, key="team_league")
+    with tt_col:
+        league_pool  = stats_season[stats_season["competition"] == sel_team_league]
+        team_options = sorted(league_pool["team_name"].dropna().unique())
+        sel_team_name = st.selectbox("Team", team_options, key="team_select")
+
+    st.markdown("---")
+
+    # ── Aggregate per team (mean xT/90 across qualifying players) ─────────────
+    def _team_agg(df, metric):
+        return (
+            df[(df["pass_xt_count"] + df["dribble_xt_count"]) >= min_events]
+            .groupby("team_name")[metric]
+            .mean()
+            .reset_index()
+            .rename(columns={metric: "value"})
+        )
+
+    # League-level aggregates (for the bar chart)
+    lge_pass   = _team_agg(league_pool,  "pass_xt_per90")
+    lge_drib   = _team_agg(league_pool,  "dribble_xt_per90")
+
+    # Global aggregates (for cross-league percentile annotation)
+    glb_pass   = _team_agg(stats_season, "pass_xt_per90")
+    glb_drib   = _team_agg(stats_season, "dribble_xt_per90")
+
+    def _team_val(agg_df, team):
+        row = agg_df[agg_df["team_name"] == team]
+        return float(row["value"].iloc[0]) if not row.empty else None
+
+    tv_pass = _team_val(lge_pass,  sel_team_name)
+    tv_drib = _team_val(lge_drib,  sel_team_name)
+
+    gp_pass = pct_rank(tv_pass, glb_pass["value"]) if tv_pass is not None else None
+    gp_drib = pct_rank(tv_drib, glb_drib["value"]) if tv_drib is not None else None
+
+    # ── Percentile charts ──────────────────────────────────────────────────────
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        lge_pct_pass = pct_rank(tv_pass, lge_pass["value"]) if tv_pass is not None else None
+        if lge_pct_pass is not None:
+            st.markdown(f"**Pass xT/90 — {sel_team_league}**")
+            st.markdown(pct_label(lge_pct_pass), unsafe_allow_html=True)
+        fig = plot_team_rank_bar(
+            lge_pass.rename(columns={"value": "pass_xt_per90"}),
+            sel_team_name, "pass_xt_per90", "Avg Pass xT/90",
+            global_pct=gp_pass,
+        )
+        st.pyplot(fig); plt.close("all")
+
+    with rc2:
+        lge_pct_drib = pct_rank(tv_drib, lge_drib["value"]) if tv_drib is not None else None
+        if lge_pct_drib is not None:
+            st.markdown(f"**Dribble xT/90 — {sel_team_league}**")
+            st.markdown(pct_label(lge_pct_drib), unsafe_allow_html=True)
+        fig = plot_team_rank_bar(
+            lge_drib.rename(columns={"value": "dribble_xt_per90"}),
+            sel_team_name, "dribble_xt_per90", "Avg Dribble xT/90",
+            global_pct=gp_drib,
+        )
+        st.pyplot(fig); plt.close("all")
+
+    st.markdown("---")
+
+    # ── Best player per position group ─────────────────────────────────────────
+    st.subheader(f"Key Players — {sel_team_name}")
+    st.caption("Best player per position group (by Total xT/90). "
+               "Percentile ranked vs all players in the same position group in the league.")
+
+    grp_col_t  = ("primary_grouped_position"
+                  if "primary_grouped_position" in league_pool.columns
+                  else _grp_list_col2)
+    name_col_t = "name_clean" if "name_clean" in league_pool.columns else "name"
+
+    team_valid = league_pool[
+        (league_pool["team_name"] == sel_team_name) &
+        ((league_pool["pass_xt_count"] + league_pool["dribble_xt_count"]) >= min_events)
+    ].copy()
+
+    if team_valid.empty:
+        st.info("No players meet the minimum action threshold for this team.")
+    else:
+        best_per_grp = (
+            team_valid
+            .sort_values("total_xt_per90", ascending=False)
+            .drop_duplicates(grp_col_t)
+            [[name_col_t, grp_col_t,
+              "pass_xt_per90", "dribble_xt_per90", "total_xt_per90"]]
+            .copy()
+        )
+
+        # Compute league percentile per player vs their position group peers
+        def _grp_pct(row):
+            peers_vals = league_pool[
+                league_pool[grp_col_t] == row[grp_col_t]
+            ]["total_xt_per90"]
+            pct = pct_rank(row["total_xt_per90"], peers_vals)
+            top = 100 - pct
+            color = GREEN if top <= 25 else (AMBER if top <= 50 else RED)
+            return f'<span style="color:{color};font-weight:700">Top {top:.0f}%</span>'
+
+        best_per_grp["League %ile"] = best_per_grp.apply(_grp_pct, axis=1)
+
+        best_per_grp = best_per_grp.rename(columns={
+            name_col_t:          "Player",
+            grp_col_t:           "Position Group",
+            "pass_xt_per90":     "Pass xT/90",
+            "dribble_xt_per90":  "Dribble xT/90",
+            "total_xt_per90":    "Total xT/90",
+        }).sort_values("Position Group")
+
+        # Render as HTML so the coloured span shows
+        html_rows = ""
+        for _, r in best_per_grp.iterrows():
+            html_rows += (
+                f"<tr>"
+                f"<td>{r['Position Group']}</td>"
+                f"<td>{r['Player']}</td>"
+                f"<td>{r['Pass xT/90']:.2f}</td>"
+                f"<td>{r['Dribble xT/90']:.2f}</td>"
+                f"<td>{r['Total xT/90']:.2f}</td>"
+                f"<td>{r['League %ile']}</td>"
+                f"</tr>"
+            )
+        st.markdown(f"""
+        <table style="width:100%;border-collapse:collapse;color:{WHITE};font-size:0.9rem">
+          <thead>
+            <tr style="color:{MINT};border-bottom:1px solid #3a1a5c">
+              <th style="text-align:left;padding:6px">Position Group</th>
+              <th style="text-align:left;padding:6px">Player</th>
+              <th style="text-align:right;padding:6px">Pass xT/90</th>
+              <th style="text-align:right;padding:6px">Drib xT/90</th>
+              <th style="text-align:right;padding:6px">Total xT/90</th>
+              <th style="text-align:center;padding:6px">League %ile</th>
+            </tr>
+          </thead>
+          <tbody>{html_rows}</tbody>
+        </table>
+        """, unsafe_allow_html=True)
