@@ -55,3 +55,7 @@ desktop.ini
 
 # ── Exceptions: keep the xT grid (small reference file used by the app) ───────
 !Models/xT/xt.csv
+
+!Streamlit/player_xt_stats.parquet
+!Streamlit/player_xt_stats.csv
+!Streamlit/league_season_coverage.csv
