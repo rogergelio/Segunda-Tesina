@@ -206,10 +206,20 @@ def _any_in(series, selected):
     )
 
 
-# Season — mandatory, no "All" option
-all_seasons = sorted(stats["season"].dropna().unique(), reverse=True)
+# Season — mandatory; hide future/incomplete seasons and non-top5 competitions
+_EXCLUDED_SEASONS = {"2025/2026", "2025/2026 ", "2025", "2025 "}
+_EXCLUDED_COMPS   = {"Champions League", "Europa League", "UEFA Super Cup",
+                     "UEFA Women's EURO", "World Cup Qualification UEFA"}
+
+all_seasons = [
+    s for s in sorted(stats["season"].dropna().unique(), reverse=True)
+    if str(s).strip() not in _EXCLUDED_SEASONS
+]
 sel_season  = st.sidebar.selectbox("Season", all_seasons)
-stats_season = stats[stats["season"] == sel_season].copy()
+stats_season = stats[
+    (stats["season"] == sel_season) &
+    (~stats["competition"].isin(_EXCLUDED_COMPS))
+].copy()
 
 st.sidebar.markdown("---")
 
@@ -250,7 +260,7 @@ with st.sidebar.expander("League / Competition", expanded=True):
 
 # Min events
 with st.sidebar.expander("Min. xT Actions", expanded=False):
-    min_events = st.slider("", min_value=0, max_value=500, value=20, step=10, label_visibility="collapsed")
+    min_events = st.slider("", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
 
 # Build filtered set
 filtered = stats_season.copy()
@@ -281,22 +291,23 @@ filtered["_display_label"] = filtered.apply(
     axis=1,
 )
 
-player_labels = sorted(filtered["_display_label"].tolist())
-sel_label = st.sidebar.selectbox("🔍 Select Player", player_labels)
-player_row = filtered[filtered["_display_label"] == sel_label].iloc[0]
-sel_player_name = player_row[display_col]
+# Team filter — narrows the player list before final player selection
+with st.sidebar.expander("Team", expanded=False):
+    all_teams = sorted(filtered["team_name"].dropna().unique())
+    sel_teams = st.multiselect("", all_teams, default=[], label_visibility="collapsed")
 
-# Team filter — narrows the player list after initial selection
-all_teams = sorted(filtered["team_name"].dropna().unique())
-sel_teams = st.sidebar.multiselect("Team", all_teams, default=[])
+# Apply team filter to narrow player list
 if sel_teams:
-    # Re-filter and rebuild the player selector if a team is chosen
-    filtered_by_team = filtered[filtered["team_name"].isin(sel_teams)]
-    if not filtered_by_team.empty:
-        player_labels = sorted(filtered_by_team["_display_label"].tolist())
-        sel_label = st.sidebar.selectbox("🔍 Select Player (filtered)", player_labels, key="player_team")
-        player_row = filtered_by_team[filtered_by_team["_display_label"] == sel_label].iloc[0]
-        sel_player_name = player_row[display_col]
+    filtered_for_player = filtered[filtered["team_name"].isin(sel_teams)]
+    if filtered_for_player.empty:
+        filtered_for_player = filtered  # fallback if filter empties results
+else:
+    filtered_for_player = filtered
+
+player_labels = sorted(filtered_for_player["_display_label"].tolist())
+sel_label = st.sidebar.selectbox("🔍 Select Player", player_labels)
+player_row = filtered_for_player[filtered_for_player["_display_label"] == sel_label].iloc[0]
+sel_player_name = player_row[display_col]
 
 
 # ── Position-level peers (season-scoped) ──────────────────────────────────────
@@ -366,13 +377,314 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════════════════════════
 #  TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs(["📊 xT Rankings", "🗺️ xT Visualizer", "⚖️ Player Comparison", "🏟️ Team Analysis"])
+tab_readme, tab_team, tab_arb, tab_rank, tab_vis, tab_cmp = st.tabs([
+    "📖 Guide",
+    "Step 1 · 🏟️ Team Analysis",
+    "Step 2 · 🔀 Arbitrage",
+    "Step 3 · 📊 Player ID",
+    "Step 4 · 🗺️ Playstyle",
+    "Step 5 · ⚖️ Comparison",
+])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 0 — Guide / README
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_readme:
+    st.markdown(f"# Aidea — Scouting Intelligence Platform")
+    st.markdown(
+        f'<p style="color:{DIM};font-size:1rem;margin-top:-10px">'
+        f"An xT-based player and team evaluation tool for the top 5 European leagues.</p>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+
+    # ── What is xT? ──────────────────────────────────────────────────────────
+    st.markdown("## What is Expected Threat (xT)?")
+    st.markdown(f"""
+Expected Threat (**xT**) is a pitch-control model that assigns a **probability of scoring** to
+every location on the pitch. When a player moves the ball from one zone to another — via a pass
+or a dribble — the difference in xT between the destination and the origin is the **xT added**
+by that action.
+
+> A pass from deep midfield to the edge of the box might move the ball from a zone worth **0.03 xT**
+> to one worth **0.12 xT**, generating **+0.09 xT** for that action.
+
+Unlike xG (which only counts shots), xT captures **all ball-progressing actions**, making it ideal
+for evaluating **midfielders, wingers, and fullbacks** who build attacks without necessarily shooting.
+
+**Key properties:**
+- Values are derived from historical scoring probabilities, zone by zone (32 × 24 grid)
+- Normalised **per 90 minutes** so players with different workloads are comparable
+- Split into **Pass xT** and **Dribble xT** to distinguish passing range from carry ability
+""")
+
+    # ── Pitch zone plots ──────────────────────────────────────────────────────
+    st.markdown("### xT values across the pitch")
+    st.caption(
+        "Each cell shows the probability of scoring from that zone. "
+        "Passes and dribbles that move the ball toward high-value zones generate more xT."
+    )
+
+    @st.cache_data(ttl=86400)
+    def _xt_grid_plots():
+        from mplsoccer import Pitch
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+
+        grid = load_xt_grid()   # shape (24, 32)
+        pitch = Pitch(pitch_type="opta", pitch_color="#06000f", line_color="#3a1a5c")
+
+        CMAP_XT = plt.cm.get_cmap("YlOrRd")
+
+        figs = []
+        for title in ("Passes — xT Grid", "Dribbles — xT Grid"):
+            fig, ax = pitch.draw(figsize=(7, 4.5))
+            fig.patch.set_facecolor("#06000f")
+
+            bin_w = 100 / 32
+            bin_h = 100 / 24
+            for row in range(24):
+                for col in range(32):
+                    val = grid[row, col]
+                    x   = col * bin_w
+                    y   = row * bin_h
+                    color = CMAP_XT(val / (grid.max() + 1e-9))
+                    rect = plt.Rectangle((x, y), bin_w, bin_h,
+                                         color=color, alpha=0.85, zorder=2)
+                    ax.add_patch(rect)
+                    if val >= 0.05:
+                        ax.text(x + bin_w / 2, y + bin_h / 2, f"{val:.2f}",
+                                ha="center", va="center", fontsize=5,
+                                color="white", fontweight="bold", zorder=3)
+
+            sm = plt.cm.ScalarMappable(cmap=CMAP_XT,
+                                        norm=mcolors.Normalize(0, grid.max()))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, orientation="vertical",
+                                fraction=0.025, pad=0.02)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white", fontsize=7)
+            cbar.set_label("xT value", color="white", fontsize=8)
+
+            ax.set_title(title, color="#00e5b0", fontsize=13,
+                         fontweight="bold", pad=10)
+            figs.append(fig)
+        return figs
+
+    _figs = _xt_grid_plots()
+    _gc1, _gc2 = st.columns(2)
+    with _gc1:
+        st.pyplot(_figs[0]); plt.close(_figs[0])
+    with _gc2:
+        st.pyplot(_figs[1]); plt.close(_figs[1])
+
+    st.markdown("---")
+
+    # ── Scouting workflow ─────────────────────────────────────────────────────
+    st.markdown("## Scouting Workflow")
+    st.markdown("Aidea is designed as a **5-step scouting pipeline**. Each tab corresponds to one step.")
+
+    steps = [
+        ("Step 1 · 🏟️ Team Analysis",
+         "Identify weak spots in a team's squad. Compare pass and dribble xT/90 against "
+         "league and global benchmarks. The **xT Efficiency** section reveals which teams "
+         "generate the most threat per euro of market value — a proxy for squad efficiency."),
+        ("Step 2 · 🔀 Arbitrage",
+         "Once a weak spot is identified, find replacement options for the selected player. "
+         "Three categories are suggested: the **Ideal** (best performer globally), the "
+         "**Perfect Arbitrage** (best xT at the same or lower price), and the "
+         "**Money Generator** (comparable output, lowest cost)."),
+        ("Step 3 · 📊 Player Identification",
+         "Deep-dive into a specific candidate. Compare their Pass xT/90 and Dribble xT/90 "
+         "against position peers within the same league, globally, and within their age bracket. "
+         "The leaderboard table shows where they rank among the top 10 in their league."),
+        ("Step 4 · 🗺️ Playstyle Understanding",
+         "Visualise *where* a player operates and *how* they move the ball. Heatmaps of pass "
+         "start/end and dribble start/end positions reveal their spatial tendencies. "
+         "The Top 5 Most Common Plays shows their recurring patterns as pitch arrows. "
+         "Toggle the comparison panel to see how their zones differ from the positional average."),
+        ("Step 5 · ⚖️ Player Comparison",
+         "Side-by-side analysis of two players. Select any player from any position group and "
+         "league as the comparison target. The stats table shows key per-90 metrics and global "
+         "percentiles. Heatmap trios (Player 1 | Player 2 | Difference) allow visual "
+         "identification of complementary or overlapping profiles."),
+    ]
+
+    for title, desc in steps:
+        st.markdown(
+            f'<div style="background:{BG_CARD};border-left:3px solid {MINT};'
+            f'border-radius:6px;padding:14px 18px;margin-bottom:12px">'
+            f'<div style="color:{MINT};font-weight:700;font-size:0.95rem;margin-bottom:6px">'
+            f'{title}</div>'
+            f'<div style="color:#ccc;font-size:0.88rem;line-height:1.6">{desc}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB — Team Arbitrage
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_arb:
+    pname_arb = player_row.get("name_clean") or player_row["name"]
+    st.subheader(f"Team Arbitrage — {pname_arb}")
+
+    has_mv_col = "market_value_eur_m" in stats_season.columns
+
+    # ── Player profile card ───────────────────────────────────────────────────
+    arb_mv = player_row.get("market_value_eur_m")
+    arb_mv_str = f"€{arb_mv:.1f}M" if pd.notna(arb_mv) and arb_mv is not None else "N/A"
+    arb_nat = player_row.get("nationality", "–") or "–"
+    arb_age = int(player_row["age"]) if pd.notna(player_row.get("age")) else "–"
+
+    # Percentile of this player's total_xt_per90 vs position-group peers in same league
+    _arb_grp_peers = _grp_peers(stats_season, competition=player_row["competition"])
+    _arb_pct = pct_rank(player_row["total_xt_per90"], _arb_grp_peers["total_xt_per90"])
+
+    st.markdown("#### Selected Player")
+    p1a, p1b, p1c, p1d, p1e, p1f, p1g = st.columns(7)
+    p1a.metric("League",        player_row.get("competition", "–"))
+    p1b.metric("Team",          player_row.get("team_name",   "–"))
+    p1c.metric("Position Grp",  _primary_group)
+    p1d.metric("xT/90",         f"{player_row['total_xt_per90']:.3f}")
+    p1e.metric("xT/90 %ile",    f"Top {100 - _arb_pct:.0f}%")
+    p1f.metric("Age",           arb_age)
+    p1g.metric("Market Value",  arb_mv_str)
+    if arb_nat and arb_nat != "–":
+        st.markdown(
+            f'<span style="background:#0d2e1a;color:#00e5b0;border:1px solid #00e5b0;'
+            f'border-radius:4px;padding:2px 10px;font-size:13px;">🌍 {arb_nat}</span>',
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+
+    # ── Candidate pool: same position group, same season, min events ──────────
+    _arb_pool = _grp_peers(stats_season).copy()
+    # Exclude the selected player
+    _arb_pool = _arb_pool[_arb_pool["player_id"] != player_row["player_id"]].copy()
+
+    if _arb_pool.empty:
+        st.info("Not enough position-group peers to generate suggestions.")
+    else:
+        # Pre-compute percentile for all candidates
+        _pool_xt_series = _arb_pool["total_xt_per90"]
+
+        def _cand_pct(val):
+            return pct_rank(val, _pool_xt_series)
+
+        _arb_pool["_xt_pct"] = _arb_pool["total_xt_per90"].apply(_cand_pct)
+        _name_col = "name_clean" if "name_clean" in _arb_pool.columns else "name"
+
+        def _arb_card(row, rank, color):
+            mv_val = row.get("market_value_eur_m")
+            mv_s   = f"€{mv_val:.1f}M" if pd.notna(mv_val) and mv_val is not None else "N/A"
+            nat    = row.get("nationality", "–") or "–"
+            age_v  = int(row["age"]) if pd.notna(row.get("age")) else "–"
+            top_v  = 100 - row["_xt_pct"]
+            team_s = row.get("team_name", "–")
+            comp_s = row.get("competition", "–")
+
+            st.markdown(
+                f'<div style="background:{BG_CARD};border:1px solid {color};border-radius:10px;'
+                f'padding:14px 18px;margin-bottom:6px">'
+                f'<div style="color:{color};font-weight:700;font-size:0.75rem;'
+                f'letter-spacing:0.08em;margin-bottom:6px">#{rank}</div>'
+                f'<div style="color:{WHITE};font-size:1.05rem;font-weight:700;margin-bottom:2px">'
+                f'{row[_name_col]}</div>'
+                f'<div style="color:{DIM};font-size:0.82rem">'
+                f'{team_s} · {comp_s}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            ca, cb, cc, cd, ce = st.columns(5)
+            ca.metric("Market Value", mv_s)
+            cb.metric("Age",          age_v)
+            cc.metric("Nationality",  nat)
+            cd.metric("xT/90",        f"{row['total_xt_per90']:.3f}")
+            ce.metric("xT/90 %ile",   f"Top {top_v:.0f}%")
+
+        def _render_candidates(df, color, empty_msg):
+            if df.empty:
+                st.info(empty_msg)
+            else:
+                for rank, (_, row) in enumerate(df.iterrows(), 1):
+                    _arb_card(row, rank, color)
+
+        # ── Option 1: Ideal — best xT/90 in the world ──────────────────────
+        st.markdown("### 🌟 Ideal Option — Best performers in the world")
+        st.caption("Top 3 players by xT/90 in this position group globally.")
+        _render_candidates(
+            _arb_pool.nlargest(3, "total_xt_per90"),
+            MINT, "No candidates found."
+        )
+
+        st.markdown("---")
+
+        # ── Option 2: Perfect Arbitrage — best xT at same or lower market value ──
+        st.markdown("### ⚖️ Perfect Arbitrage — Best xT at same or lower market value")
+        st.caption(
+            f"Top 3 players by xT/90 whose market value ≤ {arb_mv_str}."
+            if pd.notna(arb_mv) else
+            "Market value for selected player is unknown — showing best available with known value."
+        )
+        if has_mv_col and pd.notna(arb_mv):
+            _arb_candidates = _arb_pool[
+                _arb_pool["market_value_eur_m"].notna() &
+                (_arb_pool["market_value_eur_m"] <= arb_mv)
+            ]
+        elif has_mv_col:
+            _arb_candidates = _arb_pool[_arb_pool["market_value_eur_m"].notna()]
+        else:
+            _arb_candidates = pd.DataFrame()
+
+        _render_candidates(
+            _arb_candidates.nlargest(3, "total_xt_per90") if not _arb_candidates.empty else pd.DataFrame(),
+            AMBER, "No candidates found with known market value ≤ selected player's value."
+        )
+
+        st.markdown("---")
+
+        # ── Option 3: Money Generator — same xT, cheapest price ───────────
+        st.markdown("### 💰 Money Generator — Same xT output, lowest market value")
+        player_xt = player_row["total_xt_per90"]
+        _xt_tol = max(player_xt * 0.15, 0.005)
+        _tol_note = "±15%"
+        if has_mv_col:
+            _money_candidates = _arb_pool[
+                _arb_pool["market_value_eur_m"].notna() &
+                (_arb_pool["total_xt_per90"] >= player_xt - _xt_tol) &
+                (_arb_pool["total_xt_per90"] <= player_xt + _xt_tol)
+            ]
+            if len(_money_candidates) < 3:
+                _xt_tol = player_xt * 0.30
+                _tol_note = "±30%"
+                _money_candidates = _arb_pool[
+                    _arb_pool["market_value_eur_m"].notna() &
+                    (_arb_pool["total_xt_per90"] >= player_xt - _xt_tol) &
+                    (_arb_pool["total_xt_per90"] <= player_xt + _xt_tol)
+                ]
+        else:
+            _money_candidates = pd.DataFrame()
+        st.caption(
+            f"Top 3 cheapest players producing similar xT/90 "
+            f"({player_xt:.3f} {_tol_note}: "
+            f"{player_xt - _xt_tol:.3f}–{player_xt + _xt_tol:.3f})."
+        )
+        _render_candidates(
+            _money_candidates.nsmallest(3, "market_value_eur_m") if not _money_candidates.empty else pd.DataFrame(),
+            GREEN, "No candidates found with known market value and similar xT output."
+        )
+
+        if not has_mv_col:
+            st.warning("Market value data not available. Run `merge_market_values.py` to enable arbitrage options 2 and 3.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TAB 1 — xT Rankings
 # ─────────────────────────────────────────────────────────────────────────────
-with tab1:
+with tab_rank:
     pname = player_row.get("name_clean") or player_row["name"]
     st.subheader(f"xT Profile — {pname}")
 
@@ -487,7 +799,7 @@ with tab1:
 # ─────────────────────────────────────────────────────────────────────────────
 #  TAB 2 — xT Visualizer
 # ─────────────────────────────────────────────────────────────────────────────
-with tab2:
+with tab_vis:
     pname_vis = player_row.get("name_clean") or player_row["name"]
     st.subheader(f"xT Visualizer — {pname_vis}")
 
@@ -501,7 +813,28 @@ with tab2:
         if player_events.empty:
             st.warning("No events found for this player in the events parquet.")
         else:
-            show_vs_avg = st.toggle("Compare vs Position Average", value=False)
+            _tog_col, _pos_col = st.columns([2, 3])
+            with _tog_col:
+                show_vs_avg = st.toggle("Compare vs Position Average", value=False)
+            with _pos_col:
+                # Build ordered position list: main first, then secondary (no duplicates)
+                _main_full = player_row.get("primary_position") or player_row.get("position", "")
+                _pos_full_raw = player_row.get("position_full_list") or player_row.get("position_full", "")
+                _all_pos = [_main_full] if _main_full else []
+                for _p in str(_pos_full_raw).split("|"):
+                    _p = _p.strip()
+                    if _p and _p not in _all_pos:
+                        _all_pos.append(_p)
+                _tags_html = (
+                    '<span style="color:#888;font-size:12px;margin-right:6px;">Positions:</span>'
+                    + " ".join(
+                        f'<span style="background:#0d2e1a;color:#00e5b0;border:1px solid #00e5b0;'
+                        f'border-radius:4px;padding:2px 8px;font-size:12px;white-space:nowrap;">'
+                        f'{"★ " if i == 0 else ""}{p}</span>'
+                        for i, p in enumerate(_all_pos)
+                    )
+                )
+                st.markdown(_tags_html, unsafe_allow_html=True)
             st.markdown("---")
 
             # Peer events — use position-GROUP peers (same league) for the visualizer
@@ -600,7 +933,7 @@ with tab2:
 # ─────────────────────────────────────────────────────────────────────────────
 #  TAB 3 — Player Comparison
 # ─────────────────────────────────────────────────────────────────────────────
-with tab3:
+with tab_cmp:
     st.subheader("Player Comparison")
 
     cmp_name_col  = "name_clean" if "name_clean" in stats_season.columns else "name"
@@ -673,12 +1006,14 @@ with tab3:
             p1_pct = pct_rank(p1_val, pos_global_peers[col]) if not pos_global_peers.empty else None
             p2_pct = pct_rank(p2_val, pos_global_peers[col]) if not pos_global_peers.empty else None
             cmp_rows.append({
-                "Metric":         metric_label,
-                p1_name:          f"{p1_val:.2f}",
+                "Metric":          metric_label,
+                p1_name:           f"{p1_val:.2f}",
                 f"{p1_name} %ile": f"Top {100 - p1_pct:.0f}%" if p1_pct is not None else "–",
-                p2_name:          f"{p2_val:.2f}",
+                p2_name:           f"{p2_val:.2f}",
                 f"{p2_name} %ile": f"Top {100 - p2_pct:.0f}%" if p2_pct is not None else "–",
             })
+
+        # Matches
         cmp_rows.append({
             "Metric":          "Matches",
             p1_name:           str(int(p1_row["matches_played"])),
@@ -686,6 +1021,31 @@ with tab3:
             p2_name:           str(int(p2_row["matches_played"])),
             f"{p2_name} %ile": "–",
         })
+
+        # Age
+        p1_age = int(p1_row["age"]) if pd.notna(p1_row.get("age")) else "–"
+        p2_age = int(p2_row["age"]) if pd.notna(p2_row.get("age")) else "–"
+        cmp_rows.append({
+            "Metric":          "Age",
+            p1_name:           str(p1_age),
+            f"{p1_name} %ile": "–",
+            p2_name:           str(p2_age),
+            f"{p2_name} %ile": "–",
+        })
+
+        # Market Value
+        def _fmt_mv(row):
+            mv = row.get("market_value_eur_m")
+            return f"€{mv:.1f}M" if pd.notna(mv) and mv is not None else "N/A"
+
+        cmp_rows.append({
+            "Metric":          "Market Value",
+            p1_name:           _fmt_mv(p1_row),
+            f"{p1_name} %ile": "–",
+            p2_name:           _fmt_mv(p2_row),
+            f"{p2_name} %ile": "–",
+        })
+
         st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), use_container_width=True)
         st.markdown("---")
 
@@ -718,7 +1078,7 @@ with tab3:
 # ─────────────────────────────────────────────────────────────────────────────
 #  TAB 4 — Team Analysis
 # ─────────────────────────────────────────────────────────────────────────────
-with tab4:
+with tab_team:
     st.subheader("Team Analysis")
 
     # ── Selectors ──────────────────────────────────────────────────────────────
@@ -743,49 +1103,137 @@ with tab4:
             .rename(columns={metric: "value"})
         )
 
-    # League-level aggregates (for the bar chart)
-    lge_pass   = _team_agg(league_pool,  "pass_xt_per90")
-    lge_drib   = _team_agg(league_pool,  "dribble_xt_per90")
-
-    # Global aggregates (for cross-league percentile annotation)
-    glb_pass   = _team_agg(stats_season, "pass_xt_per90")
-    glb_drib   = _team_agg(stats_season, "dribble_xt_per90")
+    lge_pass = _team_agg(league_pool,  "pass_xt_per90")
+    lge_drib = _team_agg(league_pool,  "dribble_xt_per90")
+    glb_pass = _team_agg(stats_season, "pass_xt_per90")
+    glb_drib = _team_agg(stats_season, "dribble_xt_per90")
 
     def _team_val(agg_df, team):
         row = agg_df[agg_df["team_name"] == team]
         return float(row["value"].iloc[0]) if not row.empty else None
 
-    tv_pass = _team_val(lge_pass,  sel_team_name)
-    tv_drib = _team_val(lge_drib,  sel_team_name)
+    tv_pass = _team_val(lge_pass, sel_team_name)
+    tv_drib = _team_val(lge_drib, sel_team_name)
 
-    gp_pass = pct_rank(tv_pass, glb_pass["value"]) if tv_pass is not None else None
-    gp_drib = pct_rank(tv_drib, glb_drib["value"]) if tv_drib is not None else None
+    # Ensure selected team appears in global chart (top 20 + selected team)
+    def _top_with_team(agg_df, team, n=20):
+        top = agg_df.nlargest(n, "value")
+        if team not in top["team_name"].values:
+            team_row = agg_df[agg_df["team_name"] == team]
+            top = pd.concat([top, team_row])
+        return top.copy()
 
-    # ── Percentile charts ──────────────────────────────────────────────────────
-    rc1, rc2 = st.columns(2)
-    with rc1:
+    glb_pass_chart = _top_with_team(glb_pass, sel_team_name)
+    glb_drib_chart = _top_with_team(glb_drib, sel_team_name)
+
+    # ── Section 1: Same league ─────────────────────────────────────────────────
+    st.subheader(f"League Comparison — {sel_team_league}")
+    lc1, lc2 = st.columns(2)
+    with lc1:
         lge_pct_pass = pct_rank(tv_pass, lge_pass["value"]) if tv_pass is not None else None
         if lge_pct_pass is not None:
-            st.markdown(f"**Pass xT/90 — {sel_team_league}**")
+            st.markdown("**Pass xT/90**")
             st.markdown(pct_label(lge_pct_pass), unsafe_allow_html=True)
         fig = plot_team_rank_bar(
             lge_pass.rename(columns={"value": "pass_xt_per90"}),
             sel_team_name, "pass_xt_per90", "Avg Pass xT/90",
-            global_pct=gp_pass,
         )
         st.pyplot(fig); plt.close("all")
 
-    with rc2:
+    with lc2:
         lge_pct_drib = pct_rank(tv_drib, lge_drib["value"]) if tv_drib is not None else None
         if lge_pct_drib is not None:
-            st.markdown(f"**Dribble xT/90 — {sel_team_league}**")
+            st.markdown("**Dribble xT/90**")
             st.markdown(pct_label(lge_pct_drib), unsafe_allow_html=True)
         fig = plot_team_rank_bar(
             lge_drib.rename(columns={"value": "dribble_xt_per90"}),
             sel_team_name, "dribble_xt_per90", "Avg Dribble xT/90",
-            global_pct=gp_drib,
         )
         st.pyplot(fig); plt.close("all")
+
+    st.markdown("---")
+
+    # ── Section 2: Global comparison ──────────────────────────────────────────
+    st.subheader("Global Comparison — Top 20 teams across all leagues")
+    gc1, gc2 = st.columns(2)
+    with gc1:
+        gp_pass = pct_rank(tv_pass, glb_pass["value"]) if tv_pass is not None else None
+        if gp_pass is not None:
+            st.markdown("**Pass xT/90**")
+            st.markdown(pct_label(gp_pass), unsafe_allow_html=True)
+        fig = plot_team_rank_bar(
+            glb_pass_chart.rename(columns={"value": "pass_xt_per90"}),
+            sel_team_name, "pass_xt_per90", "Avg Pass xT/90",
+        )
+        st.pyplot(fig); plt.close("all")
+
+    with gc2:
+        gp_drib = pct_rank(tv_drib, glb_drib["value"]) if tv_drib is not None else None
+        if gp_drib is not None:
+            st.markdown("**Dribble xT/90**")
+            st.markdown(pct_label(gp_drib), unsafe_allow_html=True)
+        fig = plot_team_rank_bar(
+            glb_drib_chart.rename(columns={"value": "dribble_xt_per90"}),
+            sel_team_name, "dribble_xt_per90", "Avg Dribble xT/90",
+        )
+        st.pyplot(fig); plt.close("all")
+
+    st.markdown("---")
+
+    # ── Section 3: xT per Market Value ────────────────────────────────────────
+    st.subheader("xT Efficiency — Total xT per €M of Market Value")
+    st.caption("Mean total_xt_per90 ÷ mean market_value across qualifying players with a known market value.")
+
+    def _team_xt_per_mv(df):
+        """Per-team: mean(total_xt_per90) / mean(market_value_eur_m) for players with known MV."""
+        has_mv = df[
+            (df["pass_xt_count"] + df["dribble_xt_count"] >= min_events) &
+            df["market_value_eur_m"].notna() &
+            (df["market_value_eur_m"] > 0)
+        ]
+        if has_mv.empty:
+            return pd.DataFrame(columns=["team_name", "value"])
+        agg = has_mv.groupby("team_name").apply(
+            lambda g: g["total_xt_per90"].mean() / g["market_value_eur_m"].mean()
+        ).reset_index()
+        agg.columns = ["team_name", "value"]
+        return agg.dropna(subset=["value"])
+
+    if "market_value_eur_m" not in stats_season.columns:
+        st.info("Market value data not found in parquet. Run `merge_market_values.py` first.")
+    else:
+        lge_xtmv = _team_xt_per_mv(league_pool)
+        glb_xtmv = _team_xt_per_mv(stats_season)
+
+        tv_xtmv = _team_val(lge_xtmv, sel_team_name) if not lge_xtmv.empty else None
+        glb_xtmv_chart = _top_with_team(glb_xtmv, sel_team_name) if not glb_xtmv.empty else pd.DataFrame()
+
+        mv1, mv2 = st.columns(2)
+        with mv1:
+            st.markdown(f"**League — {sel_team_league}**")
+            if tv_xtmv is not None and not lge_xtmv.empty:
+                lge_pct_mv = pct_rank(tv_xtmv, lge_xtmv["value"])
+                st.markdown(pct_label(lge_pct_mv), unsafe_allow_html=True)
+                fig = plot_team_rank_bar(
+                    lge_xtmv.rename(columns={"value": "xt_per_mv"}),
+                    sel_team_name, "xt_per_mv", "xT/90 per €M"
+                )
+                st.pyplot(fig); plt.close("all")
+            else:
+                st.info("No market value data for this league.")
+
+        with mv2:
+            st.markdown("**Global — Top 20 teams**")
+            if not glb_xtmv_chart.empty and tv_xtmv is not None:
+                glb_pct_mv = pct_rank(tv_xtmv, glb_xtmv["value"])
+                st.markdown(pct_label(glb_pct_mv), unsafe_allow_html=True)
+                fig = plot_team_rank_bar(
+                    glb_xtmv_chart.rename(columns={"value": "xt_per_mv"}),
+                    sel_team_name, "xt_per_mv", "xT/90 per €M"
+                )
+                st.pyplot(fig); plt.close("all")
+            else:
+                st.info("No market value data available.")
 
     st.markdown("---")
 
