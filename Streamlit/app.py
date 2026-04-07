@@ -785,7 +785,7 @@ with tab_rank:
             "Total xT/90":   "{:.2f}",
             "Age":           "{:.0f}",
         }),
-        use_container_width=True,
+        width='stretch',
         column_config={
             "#":            st.column_config.NumberColumn("#",            width="small"),
             "Matches":      st.column_config.NumberColumn("Matches",     width="small"),
@@ -1046,7 +1046,7 @@ with tab_cmp:
             f"{p2_name} %ile": "–",
         })
 
-        st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), use_container_width=True)
+        st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), width='stretch')
         st.markdown("---")
 
         # ── Heatmap sections ───────────────────────────────────────────────────
