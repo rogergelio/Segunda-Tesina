@@ -231,7 +231,7 @@ grp_col = "grouped_position" if "grouped_position" in stats_season.columns else 
 
 with st.sidebar.expander("Position Group", expanded=True):
     all_groups = _pos_options(stats_season, grp_list_col, grp_col)
-    sel_groups = st.multiselect("", all_groups, default=all_groups, label_visibility="collapsed")
+    sel_groups = st.multiselect("Position Group", all_groups, default=all_groups, label_visibility="collapsed")
 
 if sel_groups:
     stats_season = stats_season[_any_in(stats_season[grp_list_col], sel_groups)]
@@ -251,16 +251,16 @@ with st.sidebar.expander("Position", expanded=True):
         all_positions = [p for p in all_positions_pool if p in allowed]
     else:
         all_positions = all_positions_pool
-    sel_positions = st.multiselect("", all_positions, default=all_positions, label_visibility="collapsed")
+    sel_positions = st.multiselect("Position", all_positions, default=all_positions, label_visibility="collapsed")
 
 # Competition
 with st.sidebar.expander("League / Competition", expanded=True):
     all_comps = sorted(stats_season["competition"].dropna().unique())
-    sel_comps = st.multiselect("", all_comps, default=all_comps, label_visibility="collapsed")
+    sel_comps = st.multiselect("League / Competition", all_comps, default=all_comps, label_visibility="collapsed")
 
 # Min events
 with st.sidebar.expander("Min. xT Actions", expanded=False):
-    min_events = st.slider("", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
+    min_events = st.slider("Min. xT Actions", min_value=0, max_value=500, value=100, step=10, label_visibility="collapsed")
 
 # Build filtered set
 filtered = stats_season.copy()
@@ -294,7 +294,7 @@ filtered["_display_label"] = filtered.apply(
 # Team filter — narrows the player list before final player selection
 with st.sidebar.expander("Team", expanded=False):
     all_teams = sorted(filtered["team_name"].dropna().unique())
-    sel_teams = st.multiselect("", all_teams, default=[], label_visibility="collapsed")
+    sel_teams = st.multiselect("Team", all_teams, default=[], label_visibility="collapsed")
 
 # Apply team filter to narrow player list
 if sel_teams:
@@ -435,7 +435,7 @@ for evaluating **midfielders, wingers, and fullbacks** who build attacks without
         grid = load_xt_grid()   # shape (24, 32)
         pitch = Pitch(pitch_type="opta", pitch_color="#06000f", line_color="#3a1a5c")
 
-        CMAP_XT = plt.cm.get_cmap("YlOrRd")
+        CMAP_XT = plt.colormaps["YlOrRd"]
 
         figs = []
         for title in ("Passes — xT Grid", "Dribbles — xT Grid"):
