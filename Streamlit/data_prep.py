@@ -42,6 +42,16 @@ STATS_CSV    = OUT_DIR / "player_xt_stats.csv"
 EVENTS_OUT   = OUT_DIR / "player_events.parquet"
 COVERAGE_CSV = OUT_DIR / "league_season_coverage.csv"
 
+# Filters applied at SQL level — change here to rebuild for a different scope.
+TARGET_SEASON = "2024/2025"
+TARGET_COMPS  = (
+    "Premier League",
+    "La Liga",
+    "Bundesliga",
+    "Serie A",
+    "Ligue 1",
+)
+
 pitch   = Pitch(pitch_type="opta")
 xt_grid = np.loadtxt(XT_CSV, delimiter=",")   # shape (24, 32)
 
@@ -105,21 +115,33 @@ def main():
     conn = get_conn()
 
     # ── 1. Raw pulls ───────────────────────────────────────────────────────────
-    events = _read(conn,
-        """
-        SELECT player_id, match_id, team_id,
-               x, y, end_x, end_y,
-               type_display_name, outcome_type_display_name,
-               qualifiers::text AS qualifiers,
-               period_display_name, minute, second
-        FROM match_events
-        """,
-        "match_events"
-    )
+    _comps_sql = ", ".join(f"'{c}'" for c in TARGET_COMPS)
 
     matches = _read(conn,
-        "SELECT match_id, competition, season, home_id, away_id, home_team, away_team FROM matches",
-        "matches"
+        f"""
+        SELECT match_id, competition, season, home_id, away_id, home_team, away_team
+        FROM matches
+        WHERE season = '{TARGET_SEASON}'
+          AND competition IN ({_comps_sql})
+        """,
+        f"matches ({TARGET_SEASON}, top-5 leagues)"
+    )
+
+    events = _read(conn,
+        f"""
+        SELECT me.player_id, me.match_id, me.team_id,
+               me.x, me.y, me.end_x, me.end_y,
+               me.type_display_name, me.outcome_type_display_name,
+               me.qualifiers::text AS qualifiers,
+               me.period_display_name, me.minute, me.second
+        FROM match_events me
+        WHERE me.match_id IN (
+            SELECT match_id FROM matches
+            WHERE season = '{TARGET_SEASON}'
+              AND competition IN ({_comps_sql})
+        )
+        """,
+        f"match_events ({TARGET_SEASON}, top-5 leagues)"
     )
 
     players = _read(conn,
