@@ -251,7 +251,10 @@ with st.sidebar.expander("Position", expanded=True):
         all_positions = [p for p in all_positions_pool if p in allowed]
     else:
         all_positions = all_positions_pool
-    sel_positions = st.multiselect("Position", all_positions, default=all_positions, label_visibility="collapsed")
+    # Key includes sel_groups so the widget resets when groups change,
+    # avoiding a crash from stale session-state values not in the new options.
+    pos_key = "pos_ms_" + "_".join(sorted(sel_groups))
+    sel_positions = st.multiselect("Position", all_positions, default=all_positions, key=pos_key, label_visibility="collapsed")
 
 # Competition
 with st.sidebar.expander("League / Competition", expanded=True):
@@ -785,7 +788,7 @@ with tab_rank:
             "Total xT/90":   "{:.2f}",
             "Age":           "{:.0f}",
         }),
-        width='stretch',
+        use_container_width=True,
         column_config={
             "#":            st.column_config.NumberColumn("#",            width="small"),
             "Matches":      st.column_config.NumberColumn("Matches",     width="small"),
@@ -1046,7 +1049,7 @@ with tab_cmp:
             f"{p2_name} %ile": "–",
         })
 
-        st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), width='stretch')
+        st.dataframe(pd.DataFrame(cmp_rows).set_index("Metric"), use_container_width=True)
         st.markdown("---")
 
         # ── Heatmap sections ───────────────────────────────────────────────────
