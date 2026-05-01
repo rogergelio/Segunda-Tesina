@@ -4,6 +4,7 @@ Run:  streamlit run Streamlit/app.py
 """
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -155,6 +156,82 @@ def enrich_events(df: pd.DataFrame, xt_grid: np.ndarray) -> pd.DataFrame:
     if df["start_xt"].isna().all():
         df["start_xt"], _ = _lookup_xt(df["x"].values, df["y"].values, xt_grid)
     return df
+
+
+# ── Cached per-player + per-peer event slices ─────────────────────────────────
+# Defined after load_all_events() so closures capture the loaded data.
+# show_spinner=False keeps the UI clean; figures are cached for 24 h.
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _player_ev(player_id: int) -> pd.DataFrame:
+    """Enriched events for one player, cached by player_id."""
+    return enrich_events(
+        all_events[all_events["player_id"] == player_id].copy(), xt_grid
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _peer_ev(peer_ids: tuple) -> pd.DataFrame:
+    """Enriched events for a peer group, cached by the sorted player-id tuple."""
+    return enrich_events(
+        all_events[all_events["player_id"].isin(peer_ids)].copy(), xt_grid
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _peer_avg_xt(peer_ids: tuple) -> float:
+    ev = all_events[all_events["player_id"].isin(peer_ids)]
+    return float(ev["added_xt"].clip(lower=0).mean()) if len(ev) else 0.0
+
+
+# ── Cached figure factories ────────────────────────────────────────────────────
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fig_heatmap(player_id: int, event_type: str, use_end: bool, title: str):
+    return plot_xt_heatmap(
+        _player_ev(player_id), xt_grid,
+        event_type=event_type, use_end=use_end, title=title,
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fig_vs_avg(player_id: int, peer_ids: tuple,
+                event_type: str, use_end: bool,
+                row_title: str, player_name: str):
+    return plot_vs_average_pair(
+        _player_ev(player_id), _peer_ev(peer_ids), xt_grid,
+        event_type=event_type, use_end=use_end,
+        row_title=row_title, player_name=player_name,
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fig_top_plays(player_id: int, title: str, position_avg_xt=None):
+    return plot_top_plays(
+        _player_ev(player_id), xt_grid,
+        position_avg_xt=position_avg_xt, title=title,
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fig_comparison(p1_id: int, p2_id: int,
+                    p1_name: str, p2_name: str,
+                    event_type: str, use_end: bool, title: str):
+    return plot_comparison_trio(
+        _player_ev(p1_id), _player_ev(p2_id),
+        p1_name, p2_name,
+        event_type=event_type, use_end=use_end, title=title,
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fig_rank_bar(player_dict: dict, peers: pd.DataFrame, metric: str, label: str):
+    return plot_rank_bar(pd.Series(player_dict), peers, metric, label)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fig_team_rank_bar(agg_df: pd.DataFrame, team_name: str, metric: str, label: str):
+    return plot_team_rank_bar(agg_df, team_name, metric, label)
 
 
 # ── Percentile helpers ────────────────────────────────────────────────────────
@@ -717,6 +794,7 @@ with tab_rank:
 
     # ── Pass xT rankings ──────────────────────────────────────────────────────
     st.subheader("Pass xT / 90")
+    _pdict = player_row.to_dict()
     rc1, rc2, rc3 = st.columns(3)
     for col, peers, ctx in [
         (rc1, pos_league_peers, f"{pos_label}s · {player_row['competition']}"),
@@ -730,7 +808,7 @@ with tab_rank:
                 pct = pct_rank(player_row["pass_xt_per90"], peers["pass_xt_per90"])
                 st.markdown(f"**{ctx}**", unsafe_allow_html=False)
                 st.markdown(pct_label(pct), unsafe_allow_html=True)
-                st.pyplot(plot_rank_bar(player_row, peers, "pass_xt_per90", "Pass xT / 90"))
+                st.pyplot(_fig_rank_bar(_pdict, peers, "pass_xt_per90", "Pass xT / 90"))
                 plt.close("all")
 
     st.markdown("---")
@@ -751,7 +829,7 @@ with tab_rank:
                 pct = pct_rank(player_row["dribble_xt_per90"], peers["dribble_xt_per90"])
                 st.markdown(f"**{ctx}**", unsafe_allow_html=False)
                 st.markdown(pct_label(pct), unsafe_allow_html=True)
-                st.pyplot(plot_rank_bar(player_row, peers, "dribble_xt_per90", "Dribble xT / 90"))
+                st.pyplot(_fig_rank_bar(_pdict, peers, "dribble_xt_per90", "Dribble xT / 90"))
                 plt.close("all")
 
     st.markdown("---")
@@ -809,19 +887,17 @@ with tab_vis:
     if all_events.empty:
         st.warning("No event data found. Run `python Streamlit/data_prep.py` first.")
     else:
-        player_events = enrich_events(
-            get_player_events(all_events, int(player_row["player_id"])), xt_grid
-        )
+        _pid_vis = int(player_row["player_id"])
+        _has_ev  = not _player_ev(_pid_vis).empty
 
-        if player_events.empty:
+        if not _has_ev:
             st.warning("No events found for this player in the events parquet.")
         else:
             _tog_col, _pos_col = st.columns([2, 3])
             with _tog_col:
                 show_vs_avg = st.toggle("Compare vs Position Average", value=False)
             with _pos_col:
-                # Build ordered position list: main first, then secondary (no duplicates)
-                _main_full = player_row.get("primary_position") or player_row.get("position", "")
+                _main_full   = player_row.get("primary_position") or player_row.get("position", "")
                 _pos_full_raw = player_row.get("position_full_list") or player_row.get("position_full", "")
                 _all_pos = [_main_full] if _main_full else []
                 for _p in str(_pos_full_raw).split("|"):
@@ -840,50 +916,29 @@ with tab_vis:
                 st.markdown(_tags_html, unsafe_allow_html=True)
             st.markdown("---")
 
-            # Peer events — use position-GROUP peers (same league) for the visualizer
-            viz_peer_ids = viz_league_peers["player_id"].tolist()
-            avg_ev = None
-            if show_vs_avg and viz_peer_ids:
-                avg_ev = enrich_events(
-                    all_events[all_events["player_id"].isin(viz_peer_ids)], xt_grid
-                )
-
-            position_avg_xt = None
-            if viz_peer_ids:
-                peer_ev = all_events[all_events["player_id"].isin(viz_peer_ids)]
-                if len(peer_ev):
-                    position_avg_xt = float(peer_ev["added_xt"].clip(lower=0).mean())
+            _peer_ids_vis  = tuple(sorted(viz_league_peers["player_id"].tolist()))
+            _pos_avg_xt    = _peer_avg_xt(_peer_ids_vis) if _peer_ids_vis else None
 
             # ── Passes row ────────────────────────────────────────────────────
             pc1, pc2 = st.columns(2)
             with pc1:
                 st.markdown(f"**{pname_vis} — Pass Start xT / 90**")
-                if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(
-                        player_events, avg_ev, xt_grid,
-                        event_type="pass", use_end=False,
-                        row_title=f"{pname_vis} · Pass xT/90 — Start Position",
-                        player_name=pname_vis)
+                if show_vs_avg and _peer_ids_vis:
+                    fig = _fig_vs_avg(_pid_vis, _peer_ids_vis, "pass", False,
+                                      f"{pname_vis} · Pass xT/90 — Start Position", pname_vis)
                 else:
-                    fig = plot_xt_heatmap(
-                        player_events, xt_grid,
-                        event_type="pass", use_end=False,
-                        title=f"{pname_vis} · Pass xT/90 — Start Position")
+                    fig = _fig_heatmap(_pid_vis, "pass", False,
+                                       f"{pname_vis} · Pass xT/90 — Start Position")
                 st.pyplot(fig); plt.close("all")
 
             with pc2:
                 st.markdown(f"**{pname_vis} — Pass End xT / 90**")
-                if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(
-                        player_events, avg_ev, xt_grid,
-                        event_type="pass", use_end=True,
-                        row_title=f"{pname_vis} · Pass xT/90 — End Position",
-                        player_name=pname_vis)
+                if show_vs_avg and _peer_ids_vis:
+                    fig = _fig_vs_avg(_pid_vis, _peer_ids_vis, "pass", True,
+                                      f"{pname_vis} · Pass xT/90 — End Position", pname_vis)
                 else:
-                    fig = plot_xt_heatmap(
-                        player_events, xt_grid,
-                        event_type="pass", use_end=True,
-                        title=f"{pname_vis} · Pass xT/90 — End Position")
+                    fig = _fig_heatmap(_pid_vis, "pass", True,
+                                       f"{pname_vis} · Pass xT/90 — End Position")
                 st.pyplot(fig); plt.close("all")
 
             st.markdown("---")
@@ -893,32 +948,22 @@ with tab_vis:
             dc1, dc2 = st.columns(2)
             with dc1:
                 st.markdown(f"**{pname_vis} — Dribble Start xT / 90**")
-                if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(
-                        player_events, avg_ev, xt_grid,
-                        event_type="dribble", use_end=False,
-                        row_title=f"{pname_vis} · Dribble xT/90 — Start Position",
-                        player_name=pname_vis)
+                if show_vs_avg and _peer_ids_vis:
+                    fig = _fig_vs_avg(_pid_vis, _peer_ids_vis, "dribble", False,
+                                      f"{pname_vis} · Dribble xT/90 — Start Position", pname_vis)
                 else:
-                    fig = plot_xt_heatmap(
-                        player_events, xt_grid,
-                        event_type="dribble", use_end=False,
-                        title=f"{pname_vis} · Dribble xT/90 — Start Position")
+                    fig = _fig_heatmap(_pid_vis, "dribble", False,
+                                       f"{pname_vis} · Dribble xT/90 — Start Position")
                 st.pyplot(fig); plt.close("all")
 
             with dc2:
                 st.markdown(f"**{pname_vis} — Dribble End xT / 90**")
-                if show_vs_avg and avg_ev is not None:
-                    fig = plot_vs_average_pair(
-                        player_events, avg_ev, xt_grid,
-                        event_type="dribble", use_end=True,
-                        row_title=f"{pname_vis} · Dribble xT/90 — End Position",
-                        player_name=pname_vis)
+                if show_vs_avg and _peer_ids_vis:
+                    fig = _fig_vs_avg(_pid_vis, _peer_ids_vis, "dribble", True,
+                                      f"{pname_vis} · Dribble xT/90 — End Position", pname_vis)
                 else:
-                    fig = plot_xt_heatmap(
-                        player_events, xt_grid,
-                        event_type="dribble", use_end=True,
-                        title=f"{pname_vis} · Dribble xT/90 — End Position")
+                    fig = _fig_heatmap(_pid_vis, "dribble", True,
+                                       f"{pname_vis} · Dribble xT/90 — End Position")
                 st.pyplot(fig); plt.close("all")
 
             st.markdown("---")
@@ -927,9 +972,7 @@ with tab_vis:
             st.markdown("#### Top 5 Most Common xT Plays")
             st.caption("Grouped into 4×4 bin zones · width ∝ frequency · "
                        "green = above avg, red = below avg")
-            fig = plot_top_plays(player_events, xt_grid,
-                                 position_avg_xt=position_avg_xt,
-                                 title=f"{pname_vis} — Top Plays")
+            fig = _fig_top_plays(_pid_vis, f"{pname_vis} — Top Plays", _pos_avg_xt)
             st.pyplot(fig); plt.close("all")
 
 
@@ -1056,11 +1099,8 @@ with tab_cmp:
         if all_events.empty:
             st.warning("Event data missing. Run data_prep.py.")
         else:
-            p1_ev = enrich_events(
-                get_player_events(all_events, int(p1_row["player_id"])), xt_grid)
-            p2_ev = enrich_events(
-                get_player_events(all_events, int(p2_row["player_id"])), xt_grid)
-
+            _p1_id = int(p1_row["player_id"])
+            _p2_id = int(p2_row["player_id"])
             for section_title, event_type, use_end in [
                 ("Pass Start xT / 90",    "pass",    False),
                 ("Pass End xT / 90",      "pass",    True),
@@ -1068,10 +1108,10 @@ with tab_cmp:
                 ("Dribble End xT / 90",   "dribble", True),
             ]:
                 st.markdown(f"#### {section_title}")
-                fig = plot_comparison_trio(
-                    p1_ev, p2_ev, p1_name, p2_name,
-                    event_type=event_type, use_end=use_end,
-                    title=f"{section_title}  ·  {p1_name} vs {p2_name}",
+                fig = _fig_comparison(
+                    _p1_id, _p2_id, p1_name, p2_name,
+                    event_type, use_end,
+                    f"{section_title}  ·  {p1_name} vs {p2_name}",
                 )
                 st.pyplot(fig)
                 plt.close("all")
@@ -1137,7 +1177,7 @@ with tab_team:
         if lge_pct_pass is not None:
             st.markdown("**Pass xT/90**")
             st.markdown(pct_label(lge_pct_pass), unsafe_allow_html=True)
-        fig = plot_team_rank_bar(
+        fig = _fig_team_rank_bar(
             lge_pass.rename(columns={"value": "pass_xt_per90"}),
             sel_team_name, "pass_xt_per90", "Avg Pass xT/90",
         )
@@ -1148,7 +1188,7 @@ with tab_team:
         if lge_pct_drib is not None:
             st.markdown("**Dribble xT/90**")
             st.markdown(pct_label(lge_pct_drib), unsafe_allow_html=True)
-        fig = plot_team_rank_bar(
+        fig = _fig_team_rank_bar(
             lge_drib.rename(columns={"value": "dribble_xt_per90"}),
             sel_team_name, "dribble_xt_per90", "Avg Dribble xT/90",
         )
@@ -1164,7 +1204,7 @@ with tab_team:
         if gp_pass is not None:
             st.markdown("**Pass xT/90**")
             st.markdown(pct_label(gp_pass), unsafe_allow_html=True)
-        fig = plot_team_rank_bar(
+        fig = _fig_team_rank_bar(
             glb_pass_chart.rename(columns={"value": "pass_xt_per90"}),
             sel_team_name, "pass_xt_per90", "Avg Pass xT/90",
         )
@@ -1175,7 +1215,7 @@ with tab_team:
         if gp_drib is not None:
             st.markdown("**Dribble xT/90**")
             st.markdown(pct_label(gp_drib), unsafe_allow_html=True)
-        fig = plot_team_rank_bar(
+        fig = _fig_team_rank_bar(
             glb_drib_chart.rename(columns={"value": "dribble_xt_per90"}),
             sel_team_name, "dribble_xt_per90", "Avg Dribble xT/90",
         )
@@ -1217,7 +1257,7 @@ with tab_team:
             if tv_xtmv is not None and not lge_xtmv.empty:
                 lge_pct_mv = pct_rank(tv_xtmv, lge_xtmv["value"])
                 st.markdown(pct_label(lge_pct_mv), unsafe_allow_html=True)
-                fig = plot_team_rank_bar(
+                fig = _fig_team_rank_bar(
                     lge_xtmv.rename(columns={"value": "xt_per_mv"}),
                     sel_team_name, "xt_per_mv", "xT/90 per €M"
                 )
@@ -1230,7 +1270,7 @@ with tab_team:
             if not glb_xtmv_chart.empty and tv_xtmv is not None:
                 glb_pct_mv = pct_rank(tv_xtmv, glb_xtmv["value"])
                 st.markdown(pct_label(glb_pct_mv), unsafe_allow_html=True)
-                fig = plot_team_rank_bar(
+                fig = _fig_team_rank_bar(
                     glb_xtmv_chart.rename(columns={"value": "xt_per_mv"}),
                     sel_team_name, "xt_per_mv", "xT/90 per €M"
                 )
