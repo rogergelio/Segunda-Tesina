@@ -1,5 +1,8 @@
 competition,season,unique_team_ids,unique_team_names,unique_player_ids,unique_player_names,unique_clean_names
 Bundesliga,2024/2025,18,18,481,481,481
+Champions League,2024/2025,36,36,879,879,879
+Europa League,2024/2025,36,36,914,912,912
+LaLiga,2024/2025,20,20,590,587,587
 Ligue 1,2024/2025,18,18,542,542,542
 Premier League,2024/2025,20,20,562,562,562
 Serie A,2024/2025,20,20,600,600,600

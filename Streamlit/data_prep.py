@@ -48,7 +48,7 @@ COVERAGE_CSV = OUT_DIR / "league_season_coverage.csv"
 TARGET_SEASON = "2024/2025"
 TARGET_COMPS  = (
     "Premier League",
-    "La Liga",
+    "LaLiga",
     "Bundesliga",
     "Serie A",
     "Ligue 1",
